@@ -1,0 +1,35 @@
+{
+    "state": {
+        "arm_0": {
+            "start": 0,
+            "end": 6
+        },
+        "gripper_0": {
+            "start": 6,
+            "end": 8
+        }
+    },
+    "action": {
+        "arm_0": {
+            "start": 0,
+            "end": 6
+        },
+        "gripper_0": {
+            "start": 6,
+            "end": 7
+        }
+    },
+    "video": {
+        "external": {
+            "original_key": "observation.rgb.external"
+        },
+        "wrist": {
+            "original_key": "observation.rgb.wrist"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

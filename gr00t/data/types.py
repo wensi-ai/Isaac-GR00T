@@ -79,6 +79,7 @@ class ActionConfig:
     type: ActionType
     format: ActionFormat
     state_key: str | None = None
+    is_gripper: bool = False
 
 
 @dataclass
@@ -121,6 +122,7 @@ class ModalityConfig:
                         type=ActionType[action_config["type"]],
                         format=ActionFormat[action_config["format"]],
                         state_key=action_config.get("state_key", None),
+                        is_gripper=action_config.get("is_gripper", False),
                     )
                 parsed_action_configs.append(action_config)
             self.action_configs = parsed_action_configs

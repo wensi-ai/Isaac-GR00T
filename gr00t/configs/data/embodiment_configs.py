@@ -358,4 +358,7 @@ def register_modality_config(
     assert embodiment_tag.value not in MODALITY_CONFIGS, (
         f"Embodiment tag {embodiment_tag} already registered"
     )
-    MODALITY_CONFIGS[embodiment_tag.value] = config
+    # Only register the standard modality keys
+    STANDARD_KEYS = {"video", "state", "action", "language"}
+    filtered_config = {k: v for k, v in config.items() if k in STANDARD_KEYS}
+    MODALITY_CONFIGS[embodiment_tag.value] = filtered_config
