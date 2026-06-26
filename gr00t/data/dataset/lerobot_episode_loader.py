@@ -795,19 +795,28 @@ class LeRobotEpisodeLoader:
         return new_languages
 
     def __getitem__(self, idx: int) -> pd.DataFrame:
+        """Load a full episode (all video frames). See :meth:`load_episode`."""
+        return self.load_episode(idx, needed_video_indices=None)
+
+    def load_episode(
+        self, idx: int, needed_video_indices: "set[int] | list[int] | np.ndarray | None" = None
+    ) -> pd.DataFrame:
         """
-        Load complete episode data as a processed DataFrame.
+        Load episode data as a processed DataFrame.
 
         Combines parquet data loading and video decoding to create a unified DataFrame
-        containing all modality data for the episode. Video frames are converted to
-        PIL Images and stored in the DataFrame.
+        containing all modality data for the episode. Video frames are stored in the
+        DataFrame as arrays.
 
         Args:
-            idx: Episode index to load
+            idx: Episode index to load.
+            needed_video_indices: If given, decode only these (episode-local) frames
+                and leave the rest of each ``video.*`` column ``None``; the caller
+                must read only the populated positions. Skips the expensive HEVC
+                decode of unused frames. ``None`` (default) decodes the whole episode.
 
         Returns:
-            DataFrame with columns for all modalities and timestamps, with video frames
-            as PIL Images ready for further processing
+            DataFrame with columns for all modalities; video frames as arrays.
 
         Raises:
             IndexError: If episode index is out of bounds
@@ -832,17 +841,34 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
-
-        # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+        # Decode either the whole episode or only the frames the caller needs.
+        decode_all = needed_video_indices is None
+        if decode_all:
+            video_indices = np.arange(actual_length)
+        else:
+            video_indices = np.asarray(
+                sorted({int(i) for i in needed_video_indices}), dtype=np.int64
             )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+            video_indices = video_indices[(video_indices >= 0) & (video_indices < actual_length)]
 
-        # Load synchronized mask data
+        # Load synchronized video data (only the requested frames are decoded)
+        video_data = self._load_video_data(episode_id, video_indices)
+
+        for key in video_data.keys():
+            if decode_all:
+                assert len(video_data[key]) == len(df), (
+                    f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+                )
+                df[f"video.{key}"] = [frame for frame in video_data[key]]
+            else:
+                # Sparse fill: place decoded frames at their absolute positions; other
+                # rows stay None and are never read (guaranteed by the caller).
+                column: list = [None] * actual_length
+                for pos, frame in zip(video_indices.tolist(), video_data[key]):
+                    column[pos] = frame
+                df[f"video.{key}"] = column
+
+        # Load synchronized mask data (masks come from npz, not the HEVC bottleneck)
         mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
         for key in mask_data.keys():
             assert len(mask_data[key]) == len(df), (
