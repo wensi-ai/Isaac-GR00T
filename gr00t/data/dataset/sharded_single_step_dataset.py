@@ -140,6 +140,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        decode_only_used_frames: bool = False,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -147,6 +148,13 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs
+        # Decode only the frames each shard uses, not every touched frame (see config).
+        self.decode_only_used_frames = decode_only_used_frames
+        self._video_delta_indices = (
+            list(modality_configs["video"].delta_indices)
+            if "video" in modality_configs
+            else [0]
+        )
         self.shard_size = shard_size
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
@@ -297,8 +305,24 @@ class ShardedSingleStepDataset(ShardedDataset):
         episodes = self.sharded_episodes[idx]
         datapoints = []
         for ep_idx, step_indices in episodes:
-            # Load episode data once per episode in shard
-            episode_data = self.episode_loader[ep_idx]
+            if self.decode_only_used_frames:
+                # Compute exactly the frames this shard reads. MUST match
+                # extract_step_data: step + video_delta_indices, clamped to
+                # [0, len-1] only when allow_padding (else out-of-range raises there).
+                ep_len = self.episode_loader.get_episode_length(ep_idx)
+                needed = set()
+                for s in step_indices:
+                    for d in self._video_delta_indices:
+                        idx = int(s) + int(d)
+                        if self.allow_padding:
+                            idx = max(0, min(idx, ep_len - 1))
+                        needed.add(idx)
+                episode_data = self.episode_loader.load_episode(
+                    ep_idx, needed_video_indices=needed
+                )
+            else:
+                # Load episode data once per episode in shard (decodes all frames)
+                episode_data = self.episode_loader[ep_idx]
             for step_index in step_indices:
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints

@@ -352,6 +352,10 @@ MODALITY_CONFIGS = {
 }
 
 
+# Serving-only robot fields
+ROBOT_OBS_CONFIGS: dict[str, dict] = {}
+
+
 def register_modality_config(
     config: dict, embodiment_tag: EmbodimentTag = EmbodimentTag.NEW_EMBODIMENT
 ):
@@ -362,3 +366,8 @@ def register_modality_config(
     STANDARD_KEYS = {"video", "state", "action", "language"}
     filtered_config = {k: v for k, v in config.items() if k in STANDARD_KEYS}
     MODALITY_CONFIGS[embodiment_tag.value] = filtered_config
+    # Preserve serving-only fields (e.g. "name", "observation") that eval
+    # wrappers need but that are not part of the data/training modality schema.
+    serving_config = {k: v for k, v in config.items() if k in {"name", "observation"}}
+    if serving_config:
+        ROBOT_OBS_CONFIGS[embodiment_tag.value] = serving_config
