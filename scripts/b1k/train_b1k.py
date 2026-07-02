@@ -1,4 +1,4 @@
-# Launch finetuning for N1.6 on "single node".
+# Launch finetuning for N1.7 on "single node".
 # This script tries to provide a similar user experience as current OSS.
 
 import os
@@ -6,6 +6,7 @@ import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.eval.eval_b1k_wrapper import load_modality_config
 from gr00t.experiment.experiment import run
 
@@ -16,7 +17,7 @@ if __name__ == "__main__":
         os.environ["LOGURU_LEVEL"] = "INFO"
     # Use tyro for clean CLI
     ft_config = tyro.cli(FinetuneConfig, description=__doc__)
-    embodiment_tag = ft_config.embodiment_tag.value
+    embodiment_tag = EmbodimentTag.resolve(ft_config.embodiment_tag).value
 
     # all rank workers should register for the modality config
     if ft_config.modality_config_path is not None:
@@ -49,8 +50,6 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.eagle_collator = True
-    config.model.model_name = "nvidia/Eagle-Block2A-2B-v2"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
@@ -70,9 +69,13 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = "B1K"
     config.training.experiment_name = ft_config.experiment_name
+    config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
+    config.training.save_only_model = ft_config.save_only_model
+    config.training.skip_weight_loading = ft_config.skip_weight_loading
 
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.decode_only_used_frames = ft_config.decode_only_used_frames
 
     run(config)

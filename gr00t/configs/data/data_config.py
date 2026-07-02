@@ -86,6 +86,10 @@ class DataConfig:
     multiprocessing_context: str = "fork"  # Options: "fork", "spawn", and "forkserver"
     allow_padding: bool = False
 
+    # Decode only the frames each shard uses, not every frame in the touched
+    # episodes. Identical data, ~episode_sampling_rate of the decode work + memory.
+    decode_only_used_frames: bool = False
+
     # Subsample ratio for the dataset
     subsample_ratio: float = 1.0
 

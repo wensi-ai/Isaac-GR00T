@@ -32,7 +32,7 @@ providing episode-level data access with support for multi-modal data including:
 Returns messages with VLAStepData as defined in types.py.
 """
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import json
 import logging
 from pathlib import Path
@@ -41,10 +41,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from gr00t.data.types import ModalityConfig
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
-from gr00t.utils.video_utils import get_frames_by_indices
+from gr00t.utils.video_utils import VideoReaderPool, get_frames_by_indices
 
 
 # LeRobot standard metadata filenames
@@ -55,6 +57,12 @@ LEROBOT_TASKS_FILENAME = "tasks.jsonl"
 LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
+
+# LeRobot v3.0 consolidates per-episode files into multi-episode chunk files and
+# stores episode/task metadata as parquet (vs. JSONL in v2.x). These live under
+# meta/ and replace episodes.jsonl / tasks.jsonl when codebase_version >= v3.0.
+LEROBOT_V30_EPISODES_DIR_NAME = "episodes"
+LEROBOT_V30_TASKS_FILENAME = "tasks.parquet"
 
 ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
 DEFAULT_COLUMN_NAMES = {
@@ -119,6 +127,8 @@ class LeRobotEpisodeLoader:
         modality_configs: dict[str, ModalityConfig],
         video_backend: str = "torchcodec",
         video_backend_kwargs: dict[str, Any] | None = None,
+        data_cache_size: int | None = None,
+        video_cache_size: int | None = None,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -127,6 +137,13 @@ class LeRobotEpisodeLoader:
         1. Loading all metadata files from the dataset
         2. Parsing and validating modality configurations
         3. Computing effective episode lengths based on action horizon
+        4. (v3.0 only) Setting up the per-file parquet/video caches
+
+        Args:
+            data_cache_size: Max v3.0 data parquet tables to keep cached.
+                ``None`` defaults to the data-file count (capped). Ignored for v2.x.
+            video_cache_size: Max v3.0 video decoders to keep cached.
+                ``None`` defaults to the video-file count (capped). Ignored for v2.x.
         """
         self.dataset_path = Path(dataset_path)
         self.video_backend = video_backend
@@ -143,6 +160,13 @@ class LeRobotEpisodeLoader:
 
         # Compute effective episode lengths accounting for action horizon
         self.episode_lengths = self.get_episode_lengths()
+
+        # Per-file I/O caches keyed by file, so v3.0's many-episodes-per-file
+        # layout reads each file once instead of once per episode. Inert on v2.x.
+        self._table_cache: "OrderedDict[tuple[int, int], Any]" = OrderedDict()
+        self._video_pool: VideoReaderPool | None = None
+        if self.is_v30:
+            self._init_v30_caches(data_cache_size, video_cache_size)
 
     def _load_metadata(self) -> None:
         """
@@ -162,16 +186,27 @@ class LeRobotEpisodeLoader:
         with open(info_path, "r") as f:
             self.info_meta = json.load(f)
 
-        # Load episode metadata (one episode per line)
-        episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
-        with open(episodes_path, "r") as f:
-            self.episodes_metadata = [json.loads(line) for line in f]
+        # Detect the LeRobot dataset codebase version
+        self.codebase_version = str(self.info_meta.get("codebase_version", "v2.1"))
+        self.is_v30 = self._parse_major_version(self.codebase_version) >= 3
 
-        # Load task descriptions and create mapping
-        tasks_path = meta_dir / LEROBOT_TASKS_FILENAME
-        with open(tasks_path, "r") as f:
-            tasks_data = [json.loads(line) for line in f]
-            self.tasks_map = {task["task_index"]: task["task"] for task in tasks_data}
+        if self.is_v30:
+            self.episodes_metadata = self._load_episodes_metadata_v30(meta_dir)
+            self.tasks_map = self._load_tasks_v30(meta_dir)
+        else:
+            # Load episode metadata (one episode per line)
+            episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
+            with open(episodes_path, "r") as f:
+                self.episodes_metadata = [json.loads(line) for line in f]
+
+            # Load task descriptions and create mapping
+            tasks_path = meta_dir / LEROBOT_TASKS_FILENAME
+            with open(tasks_path, "r") as f:
+                tasks_data = [json.loads(line) for line in f]
+                self.tasks_map = {task["task_index"]: task["task"] for task in tasks_data}
+
+        # Index episode records by their episode_index
+        self._episode_by_index = {int(ep["episode_index"]): ep for ep in self.episodes_metadata}
 
         # Load modality structure information
         modality_path = meta_dir / LEROBOT_MODALITY_FILENAME
@@ -203,6 +238,151 @@ class LeRobotEpisodeLoader:
         self.mask_path_pattern = self.info_meta.get("mask_path")
         self.chunk_size = self.info_meta["chunks_size"]
         self.fps = self.info_meta.get("fps", 30)
+
+    @staticmethod
+    def _parse_major_version(codebase_version: str) -> int:
+        """Extract the integer major version from a ``vX.Y`` codebase string.
+        """
+        digits = codebase_version.lstrip("vV").split(".")[0]
+        try:
+            return int(digits)
+        except ValueError:
+            return 2
+
+    def _load_episodes_metadata_v30(self, meta_dir: Path) -> list[dict[str, Any]]:
+        """Load consolidated per-episode metadata rows from ``meta/episodes/``.
+
+        v3.0 stores episode metadata as parquet (one row per episode) holding the
+        data-file location (``data/chunk_index``, ``data/file_index``,
+        ``dataset_from_index``, ``dataset_to_index``) and, per video key, the
+        containing file and its time span. The heavy per-episode ``stats/*``
+        columns are skipped — they are not needed for loading and inflate memory.
+        """
+        episodes_dir = meta_dir / LEROBOT_V30_EPISODES_DIR_NAME
+        pq_paths = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
+        if not pq_paths:
+            raise FileNotFoundError(
+                f"No episode parquet files found under {episodes_dir} for v3.0 dataset "
+                f"{self.dataset_path}"
+            )
+        records: list[dict[str, Any]] = []
+        for pq_path in pq_paths:
+            schema_names = pq.ParquetFile(pq_path).schema_arrow.names
+            columns = [name for name in schema_names if not name.startswith("stats/")]
+            records.extend(pq.read_table(pq_path, columns=columns).to_pylist())
+        records.sort(key=lambda record: int(record["episode_index"]))
+        return records
+
+    def _load_tasks_v30(self, meta_dir: Path) -> dict[int, str]:
+        """Load the task-index -> task-string map from ``meta/tasks.parquet``.
+
+        v3.0 stores tasks as parquet with an integer ``task_index`` column. The
+        task string may be either a regular ``task`` column or the (named) index,
+        depending on the writer; both layouts are normalized here.
+        """
+        tasks_df = pq.read_table(meta_dir / LEROBOT_V30_TASKS_FILENAME).to_pandas()
+        if tasks_df.index.name == "task":
+            tasks_df = tasks_df.reset_index()
+        return {int(row["task_index"]): str(row["task"]) for _, row in tasks_df.iterrows()}
+
+    def _init_v30_caches(self, data_cache_size: int | None, video_cache_size: int | None) -> None:
+        """Set up the v3.0 per-file parquet table cache and video decoder pool.
+
+        Precomputes the projected data columns and each file's base global row
+        index (to map an episode's global range to a within-file slice). Cache
+        sizes default to the file counts (capped) for order-independent reuse.
+        """
+        self._data_columns = self._compute_needed_data_columns()
+
+        # Base (minimum global row index) per data file → within-file offsets.
+        self._file_row_base: dict[tuple[int, int], int] = {}
+        for ep in self.episodes_metadata:
+            key = (int(ep["data/chunk_index"]), int(ep["data/file_index"]))
+            frm = int(ep["dataset_from_index"])
+            cur = self._file_row_base.get(key)
+            self._file_row_base[key] = frm if cur is None else min(cur, frm)
+
+        n_data_files = len(self._file_row_base)
+        self._table_cache_size = (
+            data_cache_size if data_cache_size is not None else max(1, min(n_data_files, 64))
+        )
+
+        n_video_files = self._count_v30_video_files()
+        pool_size = (
+            video_cache_size
+            if video_cache_size is not None
+            else max(1, min(n_video_files or 1, 32))
+        )
+        self._video_pool = VideoReaderPool(
+            self.video_backend,
+            max_size=pool_size,
+            video_backend_kwargs=self.video_backend_kwargs or {},
+        )
+
+    def _compute_needed_data_columns(self) -> list[str]:
+        """Columns the loader actually reads from a v3.0 data parquet.
+
+        Mirrors the keys accessed by ``_load_parquet_data`` (state/action/language
+        ``original_key`` plus ``episode_index``) so projection drops nothing needed.
+        """
+        cols: set[str] = {"episode_index"}
+        for modality_type in ("state", "action"):
+            if modality_type not in self.modality_configs:
+                continue
+            modality_info = self.modality_meta.get(modality_type, {})
+            for group_name in self.modality_configs[modality_type].modality_keys:
+                if group_name in modality_info:
+                    cols.add(
+                        modality_info[group_name].get(
+                            "original_key", DEFAULT_COLUMN_NAMES[modality_type]
+                        )
+                    )
+        if "language" in self.modality_configs:
+            for key in self.modality_configs["language"].modality_keys:
+                if key in LANG_KEYS:
+                    continue
+                subkey = key.replace("annotation.", "")
+                if subkey in self.modality_meta.get("annotation", {}):
+                    cols.add(self.modality_meta["annotation"][subkey].get("original_key", key))
+        return sorted(c for c in cols if isinstance(c, str))
+
+    def _count_v30_video_files(self) -> int:
+        """Number of distinct (camera, chunk, file) v3.0 mp4s the config will read."""
+        if not self.video_path_pattern or "video" not in self.modality_configs:
+            return 0
+        files: set[tuple[str, int, int]] = set()
+        for image_key in self.modality_configs["video"].modality_keys:
+            meta_key = self._video_key_mapping.get(image_key, image_key)
+            if meta_key not in self.modality_meta.get("video", {}):
+                continue
+            original_key = self.modality_meta["video"][meta_key].get(
+                "original_key", f"observation.images.{meta_key}"
+            )
+            chunk_col = f"videos/{original_key}/chunk_index"
+            file_col = f"videos/{original_key}/file_index"
+            for ep in self.episodes_metadata:
+                if chunk_col in ep and file_col in ep:
+                    files.add((original_key, int(ep[chunk_col]), int(ep[file_col])))
+        return len(files)
+
+    def _get_data_table(self, chunk_index: int, file_index: int):
+        """Return the cached column-projected Arrow table for a v3.0 data file,
+        reading it from disk at most once per cache lifetime."""
+        key = (chunk_index, file_index)
+        cached = self._table_cache.get(key)
+        if cached is not None:
+            self._table_cache.move_to_end(key)
+            return cached
+        parquet_filename = self.data_path_pattern.format(
+            chunk_index=chunk_index, file_index=file_index
+        )
+        parquet_path = self.dataset_path / parquet_filename
+        # Project to consumed columns + memory-map so per-episode slices are zero-copy.
+        table = pq.read_table(parquet_path, columns=self._data_columns, memory_map=True)
+        self._table_cache[key] = table
+        while len(self._table_cache) > self._table_cache_size:
+            self._table_cache.popitem(last=False)  # evict least-recently-used
+        return table
 
     def get_episode_lengths(self):
         """
@@ -361,13 +541,38 @@ class LeRobotEpisodeLoader:
         Returns:
             Processed DataFrame with all modality data
         """
-        # Load raw parquet data using chunking pattern
-        chunk_idx = episode_index // self.chunk_size
-        parquet_filename = self.data_path_pattern.format(
-            episode_chunk=chunk_idx, episode_index=episode_index
-        )
-        parquet_path = self.dataset_path / parquet_filename
-        original_df = pd.read_parquet(parquet_path)
+        # Load raw parquet data using the version-appropriate file layout.
+        if self.is_v30:
+            record = self._episode_by_index[episode_index]
+            chunk_index = int(record["data/chunk_index"])
+            file_index = int(record["data/file_index"])
+            # v3.0 packs many episodes into one parquet; read it once (cached) and
+            # take this episode's contiguous row slice via its within-file offset.
+            table = self._get_data_table(chunk_index, file_index)
+            base = self._file_row_base[(chunk_index, file_index)]
+            start = int(record["dataset_from_index"]) - base
+            expected_length = int(record["dataset_to_index"]) - int(record["dataset_from_index"])
+
+            sliced = table.slice(start, expected_length)
+            if (
+                sliced.num_rows != expected_length
+                or not pc.all(pc.equal(sliced.column("episode_index"), episode_index)).as_py()
+            ):
+                # Fallback for non-contiguous/out-of-order episodes: filter the
+                # already-cached table by episode_index (no extra disk read).
+                sliced = table.filter(pc.equal(table.column("episode_index"), episode_index))
+            original_df = sliced.to_pandas()
+            assert len(original_df) == expected_length, (
+                f"v3.0 episode {episode_index} slice has {len(original_df)} rows, "
+                f"expected {expected_length} (from dataset_from/to_index)"
+            )
+        else:
+            chunk_idx = episode_index // self.chunk_size
+            parquet_filename = self.data_path_pattern.format(
+                episode_chunk=chunk_idx, episode_index=episode_index
+            )
+            parquet_path = self.dataset_path / parquet_filename
+            original_df = pd.read_parquet(parquet_path)
         loaded_df = pd.DataFrame()
 
         # Process language annotations (convert task indices to task strings)
@@ -421,6 +626,7 @@ class LeRobotEpisodeLoader:
 
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys
+        record = self._episode_by_index[episode_index] if self.is_v30 else None
 
         for image_key in image_keys:
             # Resolve the original key used in video file naming.
@@ -433,21 +639,43 @@ class LeRobotEpisodeLoader:
                 f"Original key {original_key} not found in feature config"
             )
 
-            # Construct video file path using pattern
-            video_filename = self.video_path_pattern.format(
-                episode_chunk=chunk_idx,
-                video_key=original_key,
-                episode_index=episode_index,
-            )
+            if self.is_v30:
+                # v3.0 concatenates many episodes into one mp4 per video key. The
+                # file location and this episode's time span come from the episode
+                # record; the episode's frames begin at round(from_timestamp*fps)
+                # within that file, so shift the per-episode indices by that offset.
+                video_filename = self.video_path_pattern.format(
+                    video_key=original_key,
+                    chunk_index=int(record[f"videos/{original_key}/chunk_index"]),
+                    file_index=int(record[f"videos/{original_key}/file_index"]),
+                )
+                from_timestamp = float(record[f"videos/{original_key}/from_timestamp"])
+                frame_offset = int(round(from_timestamp * self.fps))
+                frame_indices = np.asarray(indices) + frame_offset
+            else:
+                # v2.x stores one mp4 per episode; per-episode indices are absolute.
+                video_filename = self.video_path_pattern.format(
+                    episode_chunk=chunk_idx,
+                    video_key=original_key,
+                    episode_index=episode_index,
+                )
+                frame_indices = indices
+
             video_path = self.dataset_path / video_filename
 
-            # Decode video frames at specified timestamps
-            video_data[image_key] = get_frames_by_indices(
-                str(video_path),
-                indices,
-                video_backend=self.video_backend,
-                video_backend_kwargs=self.video_backend_kwargs or {},
-            )
+            # v3.0 packs many episodes per mp4, so reuse a pooled decoder; v2.x has
+            # one mp4 per episode and keeps the stateless path.
+            if self.is_v30 and self._video_pool is not None:
+                video_data[image_key] = self._video_pool.get_frames_by_indices(
+                    str(video_path), frame_indices
+                )
+            else:
+                video_data[image_key] = get_frames_by_indices(
+                    str(video_path),
+                    frame_indices,
+                    video_backend=self.video_backend,
+                    video_backend_kwargs=self.video_backend_kwargs or {},
+                )
 
         return video_data
 
@@ -567,19 +795,28 @@ class LeRobotEpisodeLoader:
         return new_languages
 
     def __getitem__(self, idx: int) -> pd.DataFrame:
+        """Load a full episode (all video frames). See :meth:`load_episode`."""
+        return self.load_episode(idx, needed_video_indices=None)
+
+    def load_episode(
+        self, idx: int, needed_video_indices: "set[int] | list[int] | np.ndarray | None" = None
+    ) -> pd.DataFrame:
         """
-        Load complete episode data as a processed DataFrame.
+        Load episode data as a processed DataFrame.
 
         Combines parquet data loading and video decoding to create a unified DataFrame
-        containing all modality data for the episode. Video frames are converted to
-        PIL Images and stored in the DataFrame.
+        containing all modality data for the episode. Video frames are stored in the
+        DataFrame as arrays.
 
         Args:
-            idx: Episode index to load
+            idx: Episode index to load.
+            needed_video_indices: If given, decode only these (episode-local) frames
+                and leave the rest of each ``video.*`` column ``None``; the caller
+                must read only the populated positions. Skips the expensive HEVC
+                decode of unused frames. ``None`` (default) decodes the whole episode.
 
         Returns:
-            DataFrame with columns for all modalities and timestamps, with video frames
-            as PIL Images ready for further processing
+            DataFrame with columns for all modalities; video frames as arrays.
 
         Raises:
             IndexError: If episode index is out of bounds
@@ -604,17 +841,34 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
-
-        # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+        # Decode either the whole episode or only the frames the caller needs.
+        decode_all = needed_video_indices is None
+        if decode_all:
+            video_indices = np.arange(actual_length)
+        else:
+            video_indices = np.asarray(
+                sorted({int(i) for i in needed_video_indices}), dtype=np.int64
             )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+            video_indices = video_indices[(video_indices >= 0) & (video_indices < actual_length)]
 
-        # Load synchronized mask data
+        # Load synchronized video data (only the requested frames are decoded)
+        video_data = self._load_video_data(episode_id, video_indices)
+
+        for key in video_data.keys():
+            if decode_all:
+                assert len(video_data[key]) == len(df), (
+                    f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+                )
+                df[f"video.{key}"] = [frame for frame in video_data[key]]
+            else:
+                # Sparse fill: place decoded frames at their absolute positions; other
+                # rows stay None and are never read (guaranteed by the caller).
+                column: list = [None] * actual_length
+                for pos, frame in zip(video_indices.tolist(), video_data[key]):
+                    column[pos] = frame
+                df[f"video.{key}"] = column
+
+        # Load synchronized mask data (masks come from npz, not the HEVC bottleneck)
         mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
         for key in mask_data.keys():
             assert len(mask_data[key]) == len(df), (

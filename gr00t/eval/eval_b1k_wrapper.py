@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import torch
-from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, ROBOT_OBS_CONFIGS
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.policy.policy import BasePolicy
 from pathlib import Path
@@ -74,6 +74,7 @@ class B1KPolicyWrapper:
     ) -> None:
         # Load robot config from registry
         self.robot = MODALITY_CONFIGS[embodiment_tag.value]
+        self.robot_obs = ROBOT_OBS_CONFIGS[embodiment_tag.value] # Serving-only fields
         self.modality_config = modality_config
         self.policy = policy
         self.text_prompt = text_prompt
@@ -130,14 +131,14 @@ class B1KPolicyWrapper:
         Process the input dictionary to match the expected input format for the model.
         Returns the processed input dictionary and batch size.
         """
-        prop_state = obs[f"{self.robot['name']}::proprio"]
+        prop_state = obs[f"{self.robot_obs['name']}::proprio"]
         while prop_state.ndim < 3:
             prop_state = prop_state[None, :]    # Add B and T dims if necessary
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
         video = {}
-        for camera_key in sorted(self.robot["observation"].keys()):
-            camera_obs = obs[self.robot["observation"][camera_key]][..., :3]
+        for camera_key in sorted(self.robot_obs["observation"].keys()):
+            camera_obs = obs[self.robot_obs["observation"][camera_key]][..., :3]
             camera_obs = resize_with_pad(camera_obs, *self.obs_size)
             while camera_obs.ndim < 5:
                 camera_obs = camera_obs[None, ...]    # Add B and T dims if necessary
@@ -300,7 +301,7 @@ class B1KPolicyWrapper:
         """
         Temporal ensemble: infer at every step and smooth via exponentially weighted average of all recent action sequences.
         """
-        batched = input_obs[f"{self.robot['name']}::proprio"].ndim != 1
+        batched = input_obs[f"{self.robot_obs['name']}::proprio"].ndim != 1
         input_batch, batch_size = self.process_input(input_obs)
         target_action, _ = self.policy.get_action(input_batch) # (B, T, action_dim)
         target_action = np.concatenate([target_action[key] for key in self.robot["action"].modality_keys], axis=-1)
