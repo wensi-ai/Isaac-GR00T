@@ -37,13 +37,13 @@ import tempfile
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
-from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
-from gr00t.data.state_action.pose import EndEffectorPose, JointPose
+from gr00t.data.state_action.action_chunking import EndEffectorActionChunk
+from gr00t.data.state_action.pose import EndEffectorPose
 from gr00t.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
 from gr00t.data.utils import to_json_serializable
 
@@ -134,10 +134,48 @@ def _dump_stats_cache_atomic(path: Path, data: dict[str, Any], *, indent: int | 
         raise
 
 
+def _feature_matrix_from_parquet(parquet_path: Path, feature: str) -> np.ndarray:
+    """Read one feature column of one parquet file as a float32 ``(rows, dim)`` matrix.
+
+    Arrow fast path: reshape the column's flat values buffer, bit-identical to the
+    per-row ``np.vstack`` conversion but without per-row Python objects. Falls back
+    to the per-row path for ragged or exotic layouts.
+    """
+    import pyarrow as pa
+
+    table = pq.read_table(parquet_path, columns=[feature], memory_map=True)
+    column = table.column(0).combine_chunks()
+    if pa.types.is_fixed_size_list(column.type):
+        dim = column.type.list_size
+        flat = column.values.to_numpy(zero_copy_only=False)
+        return flat.astype(np.float32, copy=False).reshape(len(column), dim)
+    if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+        offsets = column.offsets.to_numpy(zero_copy_only=False)
+        widths = np.diff(offsets)
+        if len(widths) > 0 and (widths == widths[0]).all():
+            flat = column.values.to_numpy(zero_copy_only=False)
+            # Slice off any unreferenced head/tail of the values buffer.
+            flat = flat[offsets[0] : offsets[-1]]
+            return flat.astype(np.float32, copy=False).reshape(len(column), int(widths[0]))
+    elif (
+        pa.types.is_floating(column.type)
+        or pa.types.is_integer(column.type)
+        or pa.types.is_boolean(column.type)
+    ):
+        flat = column.to_numpy(zero_copy_only=False)
+        return flat.astype(np.float32, copy=False).reshape(len(column), 1)
+    # Ragged or unrecognized layout: use the original per-row conversion.
+    series = table.to_pandas()[feature]
+    return np.vstack([np.asarray(x, dtype=np.float32) for x in series])
+
+
 def calculate_dataset_statistics(
     parquet_paths: list[Path], features: list[str] | None = None
 ) -> dict[str, dict[str, float]]:
     """Calculate the dataset statistics of all columns for a list of parquet files.
+
+    Processes one feature at a time, so peak memory is a single feature's matrix
+    rather than every column of every file at once.
 
     Args:
         parquet_paths (list[Path]): List of paths to parquet files to process.
@@ -148,27 +186,18 @@ def calculate_dataset_statistics(
         dict[str, DatasetStatisticalValues]: Dictionary mapping feature names to their
             statistical values (mean, std, min, max, q01, q99).
     """
-    # Dataset statistics
-    all_low_dim_data_list = []
-    # Collect all the data
-    for parquet_path in tqdm(
-        sorted(list(parquet_paths)),
-        desc="Collecting all parquet files...",
-    ):
-        # Load the parquet file
-        parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
-        all_low_dim_data_list.append(parquet_data)
-    all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
-    # Compute dataset statistics
-    dataset_statistics = {}
+    sorted_paths = sorted(list(parquet_paths))
     if features is None:
-        features = list(all_low_dim_data.columns)
+        features = list(pq.ParquetFile(sorted_paths[0]).schema_arrow.names)
+    dataset_statistics = {}
     for le_modality in features:
         print(f"Computing statistics for {le_modality}...")
-        np_data = np.vstack(
-            [np.asarray(x, dtype=np.float32) for x in all_low_dim_data[le_modality]]
-        )
+        blocks = [
+            _feature_matrix_from_parquet(parquet_path, le_modality)
+            for parquet_path in tqdm(sorted_paths, desc=f"Reading {le_modality}")
+        ]
+        np_data = np.vstack(blocks)
+        del blocks
         dataset_statistics[le_modality] = dict(
             mean=np.mean(np_data, axis=0).tolist(),
             std=np.std(np_data, axis=0).tolist(),
@@ -321,6 +350,15 @@ class RelativeActionLoader:
         self.loader = LeRobotEpisodeLoader(dataset_path, self.modality_configs)
 
     def load_relative_actions(self, trajectory_id: int) -> list[np.ndarray]:
+        return list(self.load_relative_actions_array(trajectory_id))
+
+    def load_relative_actions_array(self, trajectory_id: int) -> np.ndarray:
+        """Relative action chunks for one episode as a ``(usable, horizon, dim)`` float32 array.
+
+        NON_EEF chunking is a plain joint-space subtraction and is vectorized here
+        (float64 subtract, then float32 cast — bit-identical to the per-step
+        ``JointPose`` path). EEF chunking keeps the original per-step code.
+        """
         df = self.loader[trajectory_id]
 
         # OPTIMIZATION: Extract columns once and convert to numpy arrays
@@ -334,33 +372,66 @@ class RelativeActionLoader:
         # Convert to numpy arrays once - this is much faster than repeated pandas access
         state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
         action_data = df[action_key].values  # Shape: (episode_length, joint_dim)
-        trajectories = []
         usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
         action_delta_indices = np.array(self.modality_configs["action"].delta_indices)
+        state_last_delta = self.modality_configs["state"].delta_indices[-1]
+
+        if self.action_config.type == ActionType.NON_EEF:
+            actions = np.stack(action_data).astype(np.float64)  # (episode_length, dim)
+            states = np.stack(state_data).astype(np.float64)
+            horizon, dim = len(action_delta_indices), actions.shape[1]
+            if usable_length <= 0:
+                return np.empty((0, horizon, dim), dtype=np.float32)
+            window = np.arange(usable_length)[:, None] + action_delta_indices[None, :]
+            chunks = actions[window]  # (usable, horizon, dim)
+            references = states[state_last_delta : state_last_delta + usable_length]
+            return (chunks - references[:, None, :]).astype(np.float32)
+
+        if self.action_config.type != ActionType.EEF:
+            raise ValueError(f"Unknown ActionType: {self.action_config.type}")
+
+        trajectories = []
         for i in range(usable_length):
-            state_ind = self.modality_configs["state"].delta_indices[-1] + i
+            state_ind = state_last_delta + i
             action_inds = action_delta_indices + i
             last_state = state_data[state_ind]
             actions = action_data[action_inds]
-            if self.action_config.type == ActionType.EEF:
-                action_format = self.action_config.format
-                reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
-                traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
-                    reference_frame=reference_frame
-                )
-                trajectories.append(traj.to(action_format).astype(np.float32))
-            elif self.action_config.type == ActionType.NON_EEF:
-                reference_frame = JointPose(last_state)
-                traj = JointActionChunk([JointPose(m) for m in actions]).relative_chunking(
-                    reference_frame=reference_frame
-                )
-                trajectories.append(np.stack([p.joints for p in traj.poses], dtype=np.float32))
-            else:
-                raise ValueError(f"Unknown ActionType: {self.action_config.type}")
-        return trajectories
+            action_format = self.action_config.format
+            reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
+            traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
+                reference_frame=reference_frame
+            )
+            trajectories.append(traj.to(action_format).astype(np.float32))
+        return np.stack(trajectories) if trajectories else np.empty((0, 0, 0), dtype=np.float32)
+
+    def usable_lengths(self) -> np.ndarray:
+        """Per-episode count of relative-action chunks, in episode order."""
+        last_delta = self.modality_configs["action"].delta_indices[-1]
+        lengths = np.asarray(self.loader.episode_lengths, dtype=np.int64)
+        return np.maximum(0, lengths - last_delta)
 
     def __len__(self) -> int:
         return len(self.loader)
+
+
+def _select_episodes_for_step_budget(
+    usable_lengths: np.ndarray, max_steps: int | None
+) -> list[int]:
+    """Deterministically pick evenly-spaced episode ids whose usable steps fit ``max_steps``.
+
+    Even spacing keeps every task represented in task-grouped datasets. With
+    ``max_steps=None`` or a dataset under budget, every episode is selected.
+    """
+    num_episodes = len(usable_lengths)
+    total = int(usable_lengths.sum())
+    if max_steps is None or total <= max_steps:
+        return list(range(num_episodes))
+    if max_steps <= 0:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+    average = total / num_episodes
+    num_selected = int(np.clip(int(max_steps // average), 1, num_episodes))
+    selected = np.unique(np.linspace(0, num_episodes - 1, num=num_selected).round().astype(int))
+    return selected.tolist()
 
 
 def calculate_stats_for_key(
@@ -368,13 +439,33 @@ def calculate_stats_for_key(
     embodiment_tag: EmbodimentTag,
     group_key: str,
     max_episodes: int = -1,
+    max_steps: int | None = None,
 ) -> dict:
+    """Relative-action statistics for one action group.
+
+    Args:
+        max_episodes: If >= 0, use only the first ``max_episodes`` episodes (legacy).
+        max_steps: If set, cap the aggregated chunks via a deterministic
+            evenly-spaced episode subsample. Datasets under the cap are exact.
+    """
     loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key)
-    trajectories = []
-    for episode_id in tqdm(range(len(loader)), desc=f"Loading trajectories for key {group_key}"):
-        if max_episodes != -1 and episode_id >= max_episodes:
-            break
-        trajectories.extend(loader.load_relative_actions(episode_id))
+    usable = loader.usable_lengths()
+    if max_episodes != -1:
+        usable = usable[:max_episodes]
+    episode_ids = _select_episodes_for_step_budget(usable, max_steps)
+    if len(episode_ids) < len(usable):
+        print(
+            f"[stats] {group_key}: subsampling {len(episode_ids)}/{len(usable)} episodes "
+            f"(~{int(usable[episode_ids].sum())} of {int(usable.sum())} steps) to honor "
+            f"max_steps={max_steps}"
+        )
+
+    blocks = [
+        loader.load_relative_actions_array(episode_id)
+        for episode_id in tqdm(episode_ids, desc=f"Loading trajectories for key {group_key}")
+    ]
+    trajectories = np.concatenate([b for b in blocks if b.size > 0], axis=0)
+    del blocks
     return {
         "max": np.max(trajectories, axis=0),
         "min": np.min(trajectories, axis=0),
@@ -385,14 +476,17 @@ def calculate_stats_for_key(
     }
 
 
-def _compute_relative_action_fingerprint(embodiment_tag: EmbodimentTag, action_key: str) -> str:
+def _compute_relative_action_fingerprint(
+    embodiment_tag: EmbodimentTag, action_key: str, max_steps: int | None = None
+) -> str:
     """Hash the inputs that change ``calculate_stats_for_key``'s output.
 
     Cached entries in ``relative_stats.json`` are only safe to reuse when every
     such input matches what they were computed under. A stats file produced for
     one ``(delta_indices, format, state_key, ...)`` combo would otherwise be
     silently reused for a different combo with the same ``action_key`` name,
-    leading to wrong normalization without any error.
+    leading to wrong normalization without any error. ``max_steps`` joins the
+    payload only when set, so caches computed without a cap stay valid.
     """
     action_modality = MODALITY_CONFIGS[embodiment_tag.value]["action"]
     state_modality = MODALITY_CONFIGS[embodiment_tag.value]["state"]
@@ -408,11 +502,17 @@ def _compute_relative_action_fingerprint(embodiment_tag: EmbodimentTag, action_k
         "format": action_config.format.name,
         "state_key": action_config.state_key,
     }
+    if max_steps is not None:
+        payload["max_steps"] = int(max_steps)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
+def generate_rel_stats(
+    dataset_path: Path | str,
+    embodiment_tag: EmbodimentTag,
+    max_steps: int | None = None,
+) -> None:
     dataset_path = Path(dataset_path)
     action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
     if action_config.action_configs is None:
@@ -426,11 +526,13 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
     stats = _load_stats_cache(stats_path)
     fingerprints = stats.setdefault(STATS_FINGERPRINTS_KEY, {})
     for action_key in sorted(action_keys):
-        expected_fp = _compute_relative_action_fingerprint(embodiment_tag, action_key)
+        expected_fp = _compute_relative_action_fingerprint(embodiment_tag, action_key, max_steps)
         if action_key in stats and fingerprints.get(action_key) == expected_fp:
             continue
         print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
-        stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
+        stats[action_key] = calculate_stats_for_key(
+            dataset_path, embodiment_tag, action_key, max_steps=max_steps
+        )
         fingerprints[action_key] = expected_fp
     _dump_stats_cache_atomic(stats_path, to_json_serializable(dict(stats)))
 
@@ -439,6 +541,7 @@ def main(
     dataset_path: Path | str,
     embodiment_tag: EmbodimentTag,
     modality_config_path: str | None = None,
+    rel_stats_max_steps: int | None = None,
 ):
     """Generate dataset statistics.
 
@@ -447,6 +550,8 @@ def main(
         embodiment_tag: Embodiment tag for modality configurations.
         modality_config_path: Optional path to a .py modality config file. Required for custom
             embodiment tags not in the built-in MODALITY_CONFIGS registry.
+        rel_stats_max_steps: Optional cap on relative-action chunks aggregated per
+            action key (deterministic evenly-spaced episode subsample).
     """
     if modality_config_path is not None:
         import importlib
@@ -462,7 +567,7 @@ def main(
                 f"Modality config path does not exist or is not a .py file: {modality_config_path}"
             )
     generate_stats(dataset_path)
-    generate_rel_stats(dataset_path, embodiment_tag)
+    generate_rel_stats(dataset_path, embodiment_tag, max_steps=rel_stats_max_steps)
 
 
 if __name__ == "__main__":

@@ -77,5 +77,8 @@ if __name__ == "__main__":
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.decode_only_used_frames = ft_config.decode_only_used_frames
+    config.data.rel_stats_max_steps = (
+        None if ft_config.rel_stats_max_steps == -1 else ft_config.rel_stats_max_steps
+    )
 
     run(config)

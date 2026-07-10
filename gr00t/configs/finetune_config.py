@@ -177,9 +177,15 @@ class FinetuneConfig:
     Relieves the dataloader video-decode bottleneck; most effective at low
     episode_sampling_rate."""
 
+    rel_stats_max_steps: int = -1
+    """Cap on relative-action chunks per action key when generating
+    meta/relative_stats.json. -1 (default) computes exact statistics over every
+    episode. A positive cap subsamples episodes deterministically and is part of
+    the stats cache fingerprint, so use the same value with gr00t/data/stats.py."""
+
     experiment_name: str = "gr00t-b1k-finetune"
     """Name of the experiment for logging purposes (e.g., wandb)."""
-    
+
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(

@@ -190,8 +190,18 @@ class LeRobotEpisodeLoader:
         self.codebase_version = str(self.info_meta.get("codebase_version", "v2.1"))
         self.is_v30 = self._parse_major_version(self.codebase_version) >= 3
 
+        # Extract key configuration parameters
+        self.feature_config = self.info_meta.get("features", {})
+        self.data_path_pattern = self.info_meta["data_path"]
+        self.video_path_pattern = self.info_meta.get("video_path")
+        self.mask_path_pattern = self.info_meta.get("mask_path")
+        self.chunk_size = self.info_meta["chunks_size"]
+        self.fps = self.info_meta.get("fps", 30)
+
         if self.is_v30:
-            self.episodes_metadata = self._load_episodes_metadata_v30(meta_dir)
+            self.episodes_metadata = self._filter_v30_episodes_to_local_files(
+                self._load_episodes_metadata_v30(meta_dir)
+            )
             self.tasks_map = self._load_tasks_v30(meta_dir)
         else:
             # Load episode metadata (one episode per line)
@@ -231,18 +241,9 @@ class LeRobotEpisodeLoader:
             relative_stats.pop("__fingerprints__", None)
             self.stats["relative_action"] = relative_stats
 
-        # Extract key configuration parameters
-        self.feature_config = self.info_meta.get("features", {})
-        self.data_path_pattern = self.info_meta["data_path"]
-        self.video_path_pattern = self.info_meta.get("video_path")
-        self.mask_path_pattern = self.info_meta.get("mask_path")
-        self.chunk_size = self.info_meta["chunks_size"]
-        self.fps = self.info_meta.get("fps", 30)
-
     @staticmethod
     def _parse_major_version(codebase_version: str) -> int:
-        """Extract the integer major version from a ``vX.Y`` codebase string.
-        """
+        """Extract the integer major version from a ``vX.Y`` codebase string."""
         digits = codebase_version.lstrip("vV").split(".")[0]
         try:
             return int(digits)
@@ -272,6 +273,49 @@ class LeRobotEpisodeLoader:
             records.extend(pq.read_table(pq_path, columns=columns).to_pylist())
         records.sort(key=lambda record: int(record["episode_index"]))
         return records
+
+    def _filter_v30_episodes_to_local_files(
+        self, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Keep only episode records whose v3.0 data parquet exists locally.
+
+        Single-task subsets of a multi-task release ship the full ``meta/episodes``
+        but only some data/video chunks, with global episode indices. Filtering is
+        per data file, so within-file row offsets from ``dataset_from_index`` stay
+        correct.
+        """
+        file_exists: dict[tuple[int, int], bool] = {}
+        kept: list[dict[str, Any]] = []
+        for record in records:
+            key = (int(record["data/chunk_index"]), int(record["data/file_index"]))
+            exists = file_exists.get(key)
+            if exists is None:
+                data_path = self.dataset_path / self.data_path_pattern.format(
+                    chunk_index=key[0], file_index=key[1]
+                )
+                exists = data_path.is_file()
+                file_exists[key] = exists
+            if exists:
+                kept.append(record)
+
+        if not kept:
+            raise FileNotFoundError(
+                f"None of the {len(records)} episodes listed in meta/episodes have their "
+                f"data parquet present under {self.dataset_path}. Check that the dataset's "
+                f"data/ directory was downloaded."
+            )
+        if len(kept) < len(records):
+            logging.warning(
+                "Dataset %s: meta/episodes lists %d episodes but only %d have their data "
+                "files locally (episode_index %d..%d); training on the local subset. This "
+                "is expected for single-task subsets of a multi-task v3.0 release.",
+                self.dataset_path,
+                len(records),
+                len(kept),
+                int(kept[0]["episode_index"]),
+                int(kept[-1]["episode_index"]),
+            )
+        return kept
 
     def _load_tasks_v30(self, meta_dir: Path) -> dict[int, str]:
         """Load the task-index -> task-string map from ``meta/tasks.parquet``.

@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import logging
-import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -125,6 +124,45 @@ def load_episode_records(root: Path) -> list[dict[str, Any]]:
     return records
 
 
+def filter_records_to_local_files(
+    root: Path, episode_records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep only episode records whose v3.0 data parquet exists under ``root``.
+
+    Single-task subsets of a multi-task release ship the full ``meta/episodes``
+    but only some data/video chunks, with global episode indices. Filtering is
+    per data file, so within-file row offsets from ``dataset_from_index`` stay
+    correct.
+    """
+    file_exists: dict[tuple[int, int], bool] = {}
+    kept: list[dict[str, Any]] = []
+    for record in episode_records:
+        key = (int(record["data/chunk_index"]), int(record["data/file_index"]))
+        exists = file_exists.get(key)
+        if exists is None:
+            data_path = root / DEFAULT_DATA_PATH.format(chunk_index=key[0], file_index=key[1])
+            exists = data_path.is_file()
+            file_exists[key] = exists
+        if exists:
+            kept.append(record)
+
+    if not kept:
+        raise FileNotFoundError(
+            f"None of the {len(episode_records)} episodes listed in meta/episodes have "
+            f"their data parquet present under {root}; nothing to convert."
+        )
+    if len(kept) < len(episode_records):
+        logging.warning(
+            "meta/episodes lists %d episodes but only %d have local data files "
+            "(episode_index %d..%d); converting the local subset only.",
+            len(episode_records),
+            len(kept),
+            int(kept[0]["episode_index"]),
+            int(kept[-1]["episode_index"]),
+        )
+    return kept
+
+
 def convert_tasks(root: Path, new_root: Path) -> None:
     logging.info("Converting tasks parquet to legacy JSONL")
     tasks = load_tasks(root)
@@ -152,8 +190,14 @@ def convert_info(
     info = load_info(root)
     logging.info("Converting info.json metadata to v2.1 schema")
 
-    total_episodes = info.get("total_episodes") or len(episode_records)
+    # Derive totals from the episodes actually converted (a subset keeps global
+    # episode indices, so the release totals in info.json would be wrong).
+    total_episodes = len(episode_records)
     chunks_size = info.get("chunks_size", DEFAULT_CHUNK_SIZE)
+    episode_indices = [int(rec["episode_index"]) for rec in episode_records]
+    episode_lengths = [
+        int(rec["dataset_to_index"]) - int(rec["dataset_from_index"]) for rec in episode_records
+    ]
 
     info["codebase_version"] = V21
 
@@ -173,8 +217,12 @@ def convert_info(
         if ft.get("dtype") != "video":
             ft.pop("fps", None)
 
-    info["total_chunks"] = math.ceil(total_episodes / chunks_size) if total_episodes > 0 else 0
+    info["total_episodes"] = total_episodes
+    info["total_frames"] = sum(episode_lengths)
+    # Episode files land in chunk episode_index // chunks_size, so report the chunk span.
+    info["total_chunks"] = (max(episode_indices) // chunks_size + 1) if total_episodes > 0 else 0
     info["total_videos"] = total_episodes * len(video_keys)
+    info["splits"] = {"train": f"{min(episode_indices)}:{max(episode_indices) + 1}"}
 
     write_info(info, new_root)
 
@@ -501,7 +549,7 @@ def convert_dataset(
         logging.info("Downloading dataset snapshot from the Hub")
         snapshot_download(repo_id, repo_type="dataset", local_dir=root)
 
-    episode_records = load_episode_records(root)
+    episode_records = filter_records_to_local_files(root, load_episode_records(root))
     info = load_info(root)
     video_keys = [key for key, ft in info["features"].items() if ft.get("dtype") == "video"]
     chunks_size = info.get("chunks_size", DEFAULT_CHUNK_SIZE)

@@ -56,9 +56,7 @@ def _validate_template(template: dict[str, Any]) -> None:
             raise ValueError(f"template action slices are not contiguous at index {cursor}")
         cursor = end
     if cursor != EXPECTED_ACTION_DIM:
-        raise ValueError(
-            f"template action covers {cursor} dims, expected {EXPECTED_ACTION_DIM}"
-        )
+        raise ValueError(f"template action covers {cursor} dims, expected {EXPECTED_ACTION_DIM}")
 
 
 def _validate_dataset(info: dict[str, Any], template: dict[str, Any]) -> list[str]:
@@ -111,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "root",
         type=Path,
-        help="Root dir to search for task datasets (e.g. .../2026-challenge-demos/b1k).",
+        help="Root dir to search for task datasets (e.g. ~/2026-challenge-demos).",
     )
     parser.add_argument(
         "--template",

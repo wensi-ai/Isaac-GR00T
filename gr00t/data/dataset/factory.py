@@ -57,7 +57,11 @@ class DatasetFactory:
                 with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
                     if is_rank0:
                         generate_stats(dataset_path)
-                        generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+                        generate_rel_stats(
+                            dataset_path,
+                            EmbodimentTag(embodiment_tag),
+                            max_steps=self.config.data.rel_stats_max_steps,
+                        )
                 dataset = ShardedSingleStepDataset(
                     dataset_path=dataset_path,
                     embodiment_tag=EmbodimentTag(embodiment_tag),

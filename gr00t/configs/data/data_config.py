@@ -90,6 +90,11 @@ class DataConfig:
     # episodes. Identical data, ~episode_sampling_rate of the decode work + memory.
     decode_only_used_frames: bool = False
 
+    # Cap on relative-action chunks per action key when generating
+    # meta/relative_stats.json. None = exact (every episode); a positive cap
+    # subsamples episodes deterministically to bound memory/time.
+    rel_stats_max_steps: Optional[int] = None
+
     # Subsample ratio for the dataset
     subsample_ratio: float = 1.0
 

@@ -69,7 +69,7 @@ def mock_calculate(monkeypatch):
     """Replace the heavy parquet-driven computation with a counter-stub."""
     calls = []
 
-    def fake(dataset_path, embodiment_tag, group_key, max_episodes=-1):
+    def fake(dataset_path, embodiment_tag, group_key, max_episodes=-1, max_steps=None):
         calls.append((str(dataset_path), embodiment_tag.value, group_key))
         return _stub_stats()
 
@@ -214,6 +214,22 @@ class TestGenerateRelStatsCache:
         assert "joint_position" not in recomputed, (
             "joint_position config did not change; must not be regenerated"
         )
+
+    def test_max_steps_change_invalidates_cache(self, dataset_dir, mock_calculate):
+        """Subsampled stats differ from exact stats; the cap must be part of the cache key."""
+        generate_rel_stats(dataset_dir, EMBODIMENT)
+        mock_calculate.clear()
+
+        # Same cap again: cache hit expected once computed with that cap.
+        generate_rel_stats(dataset_dir, EMBODIMENT, max_steps=1000)
+        assert len(mock_calculate) == len(RELATIVE_KEYS), "cap introduction must recompute"
+        mock_calculate.clear()
+        generate_rel_stats(dataset_dir, EMBODIMENT, max_steps=1000)
+        assert mock_calculate == [], "same cap must be a cache hit"
+
+        # Different cap: recompute again.
+        generate_rel_stats(dataset_dir, EMBODIMENT, max_steps=2000)
+        assert len(mock_calculate) == len(RELATIVE_KEYS)
 
     def test_partial_cache_only_recomputes_missing(self, dataset_dir, mock_calculate):
         """Pre-fill cache for one key only; the other should be the only one computed."""
