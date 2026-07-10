@@ -55,27 +55,69 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.pr
 
 logger = logging.getLogger(__name__)
 
-### Mapping from embodiment tag to projector index.
-EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
-    ##### Pretrain embodiment ids (in base model) #####
-    "oxe_droid_relative_eef_relative_joint": 24,
-    "xdof_relative_eef_relative_joint": 27,
-    "xdof_relative_eef_relative_joint_subtask": 27,
-    "real_g1_relative_eef_relative_joints": 25,
-    "real_r1_pro_sharpa_relative_eef": 26,
-    "real_r1_pro_sharpa_relative_eef_human": 26,
-    "real_r1_pro_sharpa_relative_eef_maxinsights": 26,
-    "real_r1_pro_sharpa_relative_eef_mecka": 26,
-    ##### Posttrain embodiment ids #####
-    "unitree_g1_full_body_with_waist_height_nav_cmd": 25,
-    "unitree_g1_sonic": 11,
-    "simpler_env_google": 0,
-    "simpler_env_widowx": 1,
-    "libero_sim": 2,
-    "new_embodiment": 10,
-    "robocasa_panda_omron": 10,
-    "robocasa_gr1_tabletop": 10,
+### Projector-index assignments, declared as ``{projector_index: {tags}}``.
+#
+# This grouped form is the source of truth: a tag only shares a projector with
+# another tag if it is deliberately placed inside that index's set, so an
+# accidental collision can't slip in unnoticed. Multiple tags share an index
+# only when they describe the *same physical embodiment*. To add a brand-new
+# embodiment, give it an unused index; to add a data-source/subtask variant of
+# an existing one, add its tag to that group.
+#
+# ``EMBODIMENT_TAG_TO_PROJECTOR_INDEX`` below is derived from this and is the
+# public, tag-keyed lookup used everywhere else.
+_PROJECTOR_INDEX_GROUPS: dict[int, set[str]] = {
+    0: {"simpler_env_google"},
+    1: {"simpler_env_widowx"},
+    2: {"libero_sim"},
+    # Finetune placeholder projector; sim-eval robocasa tags piggyback on
+    # `new_embodiment`.
+    10: {"new_embodiment", "robocasa_panda_omron", "robocasa_gr1_tabletop"},
+    11: {"unitree_g1_sonic"},
+    24: {"oxe_droid_relative_eef_relative_joint"},
+    # Same G1 embodiment either side of the pretrain/posttrain boundary
+    # (`real_g1_*` is pretrain, `unitree_g1_full_body_*` is posttrain).
+    25: {
+        "real_g1_relative_eef_relative_joints",
+        "unitree_g1_full_body_with_waist_height_nav_cmd",
+    },
+    # One R1 Pro Sharpa robot, four data-source variants.
+    26: {
+        "real_r1_pro_sharpa_relative_eef",
+        "real_r1_pro_sharpa_relative_eef_human",
+        "real_r1_pro_sharpa_relative_eef_maxinsights",
+        "real_r1_pro_sharpa_relative_eef_mecka",
+    },
+    # xdof base + subtask refinement.
+    27: {
+        "xdof_relative_eef_relative_joint",
+        "xdof_relative_eef_relative_joint_subtask",
+    },
 }
+
+
+def _build_tag_to_projector_index(groups: dict[int, set[str]]) -> dict[str, int]:
+    """Flatten ``{index: {tags}}`` into ``{tag: index}``.
+
+    Guards against a tag accidentally appearing in two groups, which would
+    otherwise be silently resolved by insertion order into a single mapping.
+    """
+    mapping: dict[str, int] = {}
+    for index, tags in groups.items():
+        for tag in tags:
+            if tag in mapping:
+                raise ValueError(
+                    f"Embodiment tag {tag!r} is assigned to multiple projector "
+                    f"indices ({mapping[tag]} and {index}) in "
+                    "_PROJECTOR_INDEX_GROUPS; each tag must map to exactly one index."
+                )
+            mapping[tag] = index
+    return mapping
+
+
+EMBODIMENT_TAG_TO_PROJECTOR_INDEX: dict[str, int] = _build_tag_to_projector_index(
+    _PROJECTOR_INDEX_GROUPS
+)
 
 
 def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3VLProcessor:
@@ -85,6 +127,33 @@ def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
     return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+
+
+def validate_action_horizons(modality_configs, max_action_horizon: int) -> None:
+    """Fail at processor construction if any configured embodiment's action horizon
+    (the number of action ``delta_indices``) exceeds ``max_action_horizon``.
+
+    ``max_action_horizon`` is set from the model's ``action_horizon``; without this
+    check a horizon/model mismatch (e.g. a 50-step embodiment on a 40-step model)
+    surfaces only deep in the first forward, after the model and dataset are built.
+    """
+    offenders: dict[str, int] = {}
+    for tag, config in modality_configs.items():
+        action = config.get("action") if isinstance(config, dict) else None
+        delta_indices = getattr(action, "delta_indices", None)
+        if delta_indices is None:
+            continue
+        horizon = len(delta_indices)
+        if horizon > max_action_horizon:
+            offenders[tag] = horizon
+    if offenders:
+        required = max(offenders.values())
+        details = ", ".join(f"{tag}={horizon}" for tag, horizon in sorted(offenders.items()))
+        raise ValueError(
+            f"Embodiment action horizon exceeds max_action_horizon ({max_action_horizon}): "
+            f"{details}. Increase model config action_horizon to >= {required} (or reduce the "
+            "embodiment action delta_indices)."
+        )
 
 
 class Gr00tN1d7DataCollator:
@@ -174,7 +243,6 @@ class Gr00tN1d7Processor(BaseProcessor):
         state_dropout_prob: float = 0.0,
         # Normalization
         use_mean_std: bool = False,
-        # Backward-compat params (stored but not actively used)
         letter_box_transform: bool = False,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
@@ -211,6 +279,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
         self.max_action_horizon = max_action_horizon
+        validate_action_horizons(self.modality_configs, self.max_action_horizon)
 
         # Save image processing settings
         self.image_crop_size = image_crop_size
@@ -243,6 +312,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                     shortest_image_edge,
                     crop_fraction,
                     extra_augmentation_config=self.extra_augmentation_config,
+                    letter_box_transform=self.letter_box_transform,
                 )
             )
         else:
@@ -251,6 +321,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 image_crop_size,
                 random_rotation_angle,
                 color_jitter_params,
+                letter_box_transform=self.letter_box_transform,
             )
         self._collator = self.data_collator_class(
             model_name=model_name,

@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""pytest hooks to make CI logs easier to read."""
+"""Shared pytest configuration."""
 
 from __future__ import annotations
 
 import contextlib
 import os
-import time
+from pathlib import Path
+import tempfile
 
+from filelock import FileLock
 import pytest
 
 
@@ -54,9 +56,6 @@ def _pin_xdist_worker_to_gpu() -> None:
 
 
 _pin_xdist_worker_to_gpu()
-
-
-_test_start_times: dict[str, float] = {}
 
 
 def _configure_shared_caches() -> None:
@@ -102,6 +101,21 @@ def pytest_configure(config) -> None:  # noqa: ARG001
     _configure_shared_caches()
 
 
+@pytest.fixture
+def serialize_subprocess_spawns():
+    """Let only one subprocess-spawning test run at a time, host-wide.
+
+    Under ``-n auto`` every core is already claimed by an xdist worker, so a
+    test that additionally spawns its own torch-importing processes
+    oversubscribes the box and can blow its wall-clock timeout. A host-wide
+    lock serializes such tests across workers; they finish in well under a
+    second when not starved, so the serialization is effectively free.
+    """
+    lock_path = Path(tempfile.gettempdir()) / "gr00t-test-subprocess-spawn.lock"
+    with FileLock(str(lock_path)):
+        yield
+
+
 @pytest.fixture(scope="session")
 def load_hf_model_weights():
     """Temporarily opt a test into normal Hugging Face checkpoint weight loading."""
@@ -119,13 +133,3 @@ def load_hf_model_weights():
                 os.environ["GROOT_SKIP_HF_MODEL_WEIGHTS"] = previous
 
     return _enabled
-
-
-def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
-    _test_start_times[nodeid] = time.perf_counter()
-    print(f"\n\n{'=' * 80}\n[TEST START] {nodeid}\n", flush=True)
-
-
-def pytest_runtest_logfinish(nodeid: str, location: tuple) -> None:
-    elapsed = time.perf_counter() - _test_start_times.pop(nodeid, time.perf_counter())
-    print(f"\n[TEST END]   {nodeid}  ({elapsed:.1f}s)\n{'=' * 80}\n\n", flush=True)

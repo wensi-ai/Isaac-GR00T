@@ -104,8 +104,7 @@ class LeRobotEpisodeLoader:
         dataset_path: Path to dataset root directory containing meta/ and data files
         modality_configs: Dictionary mapping modality names to ModalityConfig objects
                          that specify temporal sampling and data keys to load
-        video_backend: Video decoding backend ('torchcodec', 'decord', etc.)
-        video_backend_kwargs: Additional arguments for the video backend
+        decoder_kwargs: Additional arguments for the video decoder
 
     Example:
         >>> loader = LeRobotEpisodeLoader(
@@ -125,8 +124,7 @@ class LeRobotEpisodeLoader:
         self,
         dataset_path: str | Path,
         modality_configs: dict[str, ModalityConfig],
-        video_backend: str = "torchcodec",
-        video_backend_kwargs: dict[str, Any] | None = None,
+        decoder_kwargs: dict[str, Any] | None = None,
         data_cache_size: int | None = None,
         video_cache_size: int | None = None,
     ) -> None:
@@ -146,8 +144,7 @@ class LeRobotEpisodeLoader:
                 ``None`` defaults to the video-file count (capped). Ignored for v2.x.
         """
         self.dataset_path = Path(dataset_path)
-        self.video_backend = video_backend
-        self.video_backend_kwargs = video_backend_kwargs
+        self.decoder_kwargs = decoder_kwargs
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -358,9 +355,8 @@ class LeRobotEpisodeLoader:
             else max(1, min(n_video_files or 1, 32))
         )
         self._video_pool = VideoReaderPool(
-            self.video_backend,
             max_size=pool_size,
-            video_backend_kwargs=self.video_backend_kwargs or {},
+            decoder_kwargs=self.decoder_kwargs,
         )
 
     def _compute_needed_data_columns(self) -> list[str]:
@@ -717,8 +713,7 @@ class LeRobotEpisodeLoader:
                 video_data[image_key] = get_frames_by_indices(
                     str(video_path),
                     frame_indices,
-                    video_backend=self.video_backend,
-                    video_backend_kwargs=self.video_backend_kwargs or {},
+                    decoder_kwargs=self.decoder_kwargs or {},
                 )
 
         return video_data

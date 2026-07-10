@@ -8,7 +8,7 @@ For more information, see the [official repository](https://github.com/simpler-e
 
 # Benchmark results
 
-These values come from the default SimplerEnv runs recorded in `ci/metrics/METRICS.md`.
+These values come from the default SimplerEnv evaluation runs (the per-task success rates are listed below).
 
 ## Bridge (WidowX robot)
 
@@ -36,16 +36,16 @@ Provided checkpoints:
 | Task | N1.6 success rate | N1.7 success rate |
 | --- | ---: | ---: |
 | `google_robot_pick_coke_can` | 95/100 (95.0%) | 100/100 (100.0%) |
-| `google_robot_pick_object` | 87/100 (87.0%) | 96/100 (96.0%) |
-| `google_robot_move_near` | 81/100 (81.0%) | 96/100 (96.0%) |
-| `google_robot_open_drawer` | 0/100 (0.0%) | 36/100 (36.0%) |
-| `google_robot_close_drawer` | 44/100 (44.0%) | 63/100 (63.0%) |
-| `google_robot_place_in_closed_drawer` | 5/100 (5.0%) | 21/100 (21.0%) |
-| **Average** | **52.0%** | **68.7%** |
+| `google_robot_pick_object` | 87/100 (87.0%) | 94/100 (94.0%) |
+| `google_robot_move_near` | 81/100 (81.0%) | 100/100 (100.0%) |
+| `google_robot_open_drawer` | 0/100 (0.0%) | 65/100 (65.0%) |
+| `google_robot_close_drawer` | 44/100 (44.0%) | 69/100 (69.0%) |
+| `google_robot_place_in_closed_drawer` | 5/100 (5.0%) | 7/100 (7.0%) |
+| **Average** | **52.0%** | **72.5%** |
 
 # Fine-tune Simpler Env bridge dataset (WidowX robot)
 
-To reproduce our finetune results, use the following commands to setup dataset and launch finetune experiments. Please remember to set `WANDB_API_KEY` since `--use-wandb` is turned on by default. If you don't have a WANDB account, please remove this argument:
+To reproduce our finetune results, use the following commands to setup dataset and launch finetune experiments. Please remember to set `WANDB_API_KEY` since W&B logging is on by default (`USE_WANDB=1` in `examples/finetune.sh`). If you don't have a WANDB account, prepend `USE_WANDB=0` to the launch command to disable it:
 
 ```bash
 uv run hf download \
@@ -74,7 +74,7 @@ uv run hf download \
 
 # Copy the patches and run the finetune script
 cp -r examples/SimplerEnv/fractal_modality.json examples/SimplerEnv/fractal20220817_data_lerobot/meta/modality.json
-uv run python examples/SimplerEnv/convert_av1_to_h264.py examples/SimplerEnv/fractal20220817_data_lerobot --jobs 16  # (Optional) if AV1 doesn't work on your machine
+uv run python examples/SimplerEnv/convert_av1_to_h264.py --root examples/SimplerEnv/fractal20220817_data_lerobot --jobs 16
 ```
 
 ```bash
@@ -88,11 +88,9 @@ NUM_GPUS=8 MAX_STEPS=20000 GLOBAL_BATCH_SIZE=1024 SAVE_STEPS=1000 uv run bash ex
 
 # Evaluate checkpoint
 
-First, setup the evaluation simulation environment. This only needs to run once for each simulation benchmark. After it's done, we only need to launch server and client.
+First, complete the [one-time simulation environment setup](../../README.md#one-time-simulation-environment-setup), then run this benchmark's setup script (only needed once per benchmark):
 
 ```bash
-sudo apt update
-sudo apt install libegl1-mesa-dev libglu1-mesa
 bash gr00t/eval/sim/SimplerEnv/setup_SimplerEnv.sh
 ```
 
