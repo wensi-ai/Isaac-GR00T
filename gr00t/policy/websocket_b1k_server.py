@@ -1,15 +1,17 @@
 import asyncio
+from copy import deepcopy
 import functools
 import http
 import logging
-import msgpack
-import numpy as np
 import time
 import traceback
-import websockets.asyncio.server as _server
-import websockets
-from copy import deepcopy
 from typing import Any, Optional
+
+import msgpack
+import numpy as np
+import websockets
+import websockets.asyncio.server as _server
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -89,7 +91,9 @@ class WebsocketPolicyServer:
                 logger.info(f"Connection from {websocket.remote_address} closed")
                 break
             except Exception:
-                logger.error(f"Error in connection from {websocket.remote_address}:\n{traceback.format_exc()}")
+                logger.error(
+                    f"Error in connection from {websocket.remote_address}:\n{traceback.format_exc()}"
+                )
                 try:
                     # Try new websockets API first
                     await websocket.close(

@@ -65,6 +65,7 @@ import argparse
 import dataclasses
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import shutil
@@ -73,7 +74,7 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+
 
 LOSS_LINE = re.compile(r"\{'loss':")
 OOM_PATTERNS = (
@@ -209,9 +210,11 @@ def run_benchmark(spec: RunSpec, args, port: int) -> dict:
         k, _, v = kv.partition("=")
         env[k] = v
 
-    print(f"\n=== [{spec.label}] batch={spec.global_batch_size} workers="
-          f"{spec.dataloader_num_workers} OMP={spec.omp_num_threads} "
-          f"extra={' '.join(spec.train_args) or '(none)'}")
+    print(
+        f"\n=== [{spec.label}] batch={spec.global_batch_size} workers="
+        f"{spec.dataloader_num_workers} OMP={spec.omp_num_threads} "
+        f"extra={' '.join(spec.train_args) or '(none)'}"
+    )
     print(f"    cmd: {' '.join(shlex.quote(c) for c in cmd)}")
     if args.dry_run:
         return {"label": spec.label, "status": "dry-run"}
@@ -402,7 +405,9 @@ def markdown_table(records: list[dict]) -> str:
 def do_sweep(args):
     total_mem = min(gpu_total_mem_mib())
     mem_limit = total_mem * args.mem_limit_frac
-    print(f"GPU memory limit for batch axis: {mem_limit:.0f} MiB ({args.mem_limit_frac:.0%} of {total_mem} MiB)")
+    print(
+        f"GPU memory limit for batch axis: {mem_limit:.0f} MiB ({args.mem_limit_frac:.0%} of {total_mem} MiB)"
+    )
 
     cache: dict = {}
     all_records: list[dict] = []
@@ -484,13 +489,17 @@ def do_sweep(args):
             if rec["steady_samples_per_s"] >= top_sps * (1 - args.tie_tolerance)
         )
         best[axis] = contenders[0][0]
-        print(f">>> best {axis} = {best[axis]} "
-              f"({contenders[0][1]['steady_samples_per_s']} samples/s; top {top_sps})")
+        print(
+            f">>> best {axis} = {best[axis]} "
+            f"({contenders[0][1]['steady_samples_per_s']} samples/s; top {top_sps})"
+        )
 
     print("\n### Sweep complete")
-    print(f"Optimal: OMP_NUM_THREADS={best['omp']} "
-          f"--dataloader-num-workers {best['workers']} "
-          f"--global-batch-size {best['batch']}")
+    print(
+        f"Optimal: OMP_NUM_THREADS={best['omp']} "
+        f"--dataloader-num-workers {best['workers']} "
+        f"--global-batch-size {best['batch']}"
+    )
     print("\n" + markdown_table(all_records))
     summary = {
         "label": "SWEEP_SUMMARY",
@@ -520,7 +529,9 @@ def do_run(args):
 def main():
     # Line-buffer stdout so progress is visible when piped/redirected.
     sys.stdout.reconfigure(line_buffering=True)
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = p.add_subparsers(dest="mode", required=True)
 
     def add_common(sp):
@@ -531,13 +542,26 @@ def main():
         sp.add_argument("--train-script", default="scripts/b1k/train_b1k.py")
         sp.add_argument("--num-gpus", type=int, default=len(gpu_total_mem_mib()))
         sp.add_argument("--max-steps", type=int, default=120)
-        sp.add_argument("--measure-from-step", type=int, default=None,
-                        help="Steady-state window start (default: max-steps/2, rounded to logging-steps)")
-        sp.add_argument("--logging-steps", type=int, default=10,
-                        help="Must match the trainer's logging_steps (10 in this repo)")
-        sp.add_argument("--run-timeout", type=float, default=2700, help="Seconds before a run is killed")
-        sp.add_argument("--train-args", default="",
-                        help="Extra args passed through to the train script, e.g. \"--decode-only-used-frames --episode-sampling-rate 0.1\"")
+        sp.add_argument(
+            "--measure-from-step",
+            type=int,
+            default=None,
+            help="Steady-state window start (default: max-steps/2, rounded to logging-steps)",
+        )
+        sp.add_argument(
+            "--logging-steps",
+            type=int,
+            default=10,
+            help="Must match the trainer's logging_steps (10 in this repo)",
+        )
+        sp.add_argument(
+            "--run-timeout", type=float, default=2700, help="Seconds before a run is killed"
+        )
+        sp.add_argument(
+            "--train-args",
+            default="",
+            help='Extra args passed through to the train script, e.g. "--decode-only-used-frames --episode-sampling-rate 0.1"',
+        )
         sp.add_argument("--work-dir", default="bench_runs")
         sp.add_argument("--results-json", default="bench_runs/results.json")
         sp.add_argument("--master-port", type=int, default=29510)
@@ -560,12 +584,24 @@ def main():
     ps.add_argument("--base-omp", type=int, default=4)
     ps.add_argument("--base-workers", type=int, default=8)
     ps.add_argument("--base-batch", type=int, default=2048)
-    ps.add_argument("--mem-limit-frac", type=float, default=0.92,
-                    help="Batch axis: reject configs whose peak GPU mem exceeds this fraction of total")
-    ps.add_argument("--tie-tolerance", type=float, default=0.02,
-                    help="Prefer smaller values within this relative throughput of the best")
-    ps.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
-                    help="Unmeasured first run to warm the page cache")
+    ps.add_argument(
+        "--mem-limit-frac",
+        type=float,
+        default=0.92,
+        help="Batch axis: reject configs whose peak GPU mem exceeds this fraction of total",
+    )
+    ps.add_argument(
+        "--tie-tolerance",
+        type=float,
+        default=0.02,
+        help="Prefer smaller values within this relative throughput of the best",
+    )
+    ps.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Unmeasured first run to warm the page cache",
+    )
 
     args = p.parse_args()
     args.train_args_list = shlex.split(args.train_args)

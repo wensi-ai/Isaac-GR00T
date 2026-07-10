@@ -144,9 +144,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         # Decode only the frames each shard uses, not every touched frame (see config).
         self.decode_only_used_frames = decode_only_used_frames
         self._video_delta_indices = (
-            list(modality_configs["video"].delta_indices)
-            if "video" in modality_configs
-            else [0]
+            list(modality_configs["video"].delta_indices) if "video" in modality_configs else [0]
         )
         self.shard_size = shard_size
         self.episode_sampling_rate = episode_sampling_rate
@@ -308,9 +306,7 @@ class ShardedSingleStepDataset(ShardedDataset):
                         if self.allow_padding:
                             idx = max(0, min(idx, ep_len - 1))
                         needed.add(idx)
-                episode_data = self.episode_loader.load_episode(
-                    ep_idx, needed_video_indices=needed
-                )
+                episode_data = self.episode_loader.load_episode(ep_idx, needed_video_indices=needed)
             else:
                 # Load episode data once per episode in shard (decodes all frames)
                 episode_data = self.episode_loader[ep_idx]

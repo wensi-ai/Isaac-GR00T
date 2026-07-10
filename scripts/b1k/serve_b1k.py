@@ -42,7 +42,7 @@ class ServerConfig:
     strict: bool = True
     """Whether to enforce strict input and output validation"""
 
-        
+
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
     print(f"  Embodiment tag: {config.embodiment_tag}")
@@ -57,12 +57,14 @@ def main(config: ServerConfig):
         raise FileNotFoundError(f"Model path {config.model_path} does not exist")
 
     # load modality config if provided
-    assert os.path.exists(config.modality_config_path) and config.modality_config_path.endswith(".py"), (
-        f"Modality config path {config.modality_config_path} does not exist or is not a Python file"
-    )
+    assert os.path.exists(config.modality_config_path) and config.modality_config_path.endswith(
+        ".py"
+    ), f"Modality config path {config.modality_config_path} does not exist or is not a Python file"
     load_modality_config(config.modality_config_path)
     modality_json = config.modality_config_path.replace(".py", ".json")
-    assert os.path.exists(modality_json), (f"Modality config JSON file {modality_json} does not exist. ")
+    assert os.path.exists(modality_json), (
+        f"Modality config JSON file {modality_json} does not exist. "
+    )
     with open(modality_json, "r") as f:
         modality_config = json.load(f)
 

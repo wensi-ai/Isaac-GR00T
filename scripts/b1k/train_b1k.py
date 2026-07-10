@@ -2,13 +2,13 @@
 # This script tries to provide a similar user experience as current OSS.
 
 import os
-import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.eval.eval_b1k_wrapper import load_modality_config
 from gr00t.experiment.experiment import run
+import tyro
 
 
 if __name__ == "__main__":

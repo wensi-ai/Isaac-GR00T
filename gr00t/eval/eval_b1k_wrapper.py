@@ -1,47 +1,48 @@
+from pathlib import Path
+
 import cv2
-import numpy as np
-import torch
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, ROBOT_OBS_CONFIGS
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.policy.policy import BasePolicy
-from pathlib import Path
+import numpy as np
+import torch
 
 
 def resize_with_pad(image: np.ndarray, target_height: int, target_width: int) -> np.ndarray:
     """
     Resize image to target size while maintaining aspect ratio and padding with zeros.
-    
+
     Args:
         image: Input image of shape (B, H, W, C) or (H, W, C)
         target_height: Target height
         target_width: Target width
-    
+
     Returns:
         Resized and padded image of shape (B, target_height, target_width, C) or (target_height, target_width, C)
     """
     has_batch = image.ndim == 4
     if not has_batch:
         image = image[np.newaxis, ...]
-    
+
     batch_size, h, w, c = image.shape
-    
+
     # Calculate scaling factor to fit within target size while maintaining aspect ratio
     scale = min(target_height / h, target_width / w)
     new_h = int(h * scale)
     new_w = int(w * scale)
-    
+
     # Resize all images in batch
     resized_images = np.zeros((batch_size, target_height, target_width, c), dtype=image.dtype)
     for i in range(batch_size):
         resized = cv2.resize(image[i], (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        
+
         # Calculate padding
         pad_top = (target_height - new_h) // 2
         pad_left = (target_width - new_w) // 2
-        
+
         # Place resized image in center of padded canvas
-        resized_images[i, pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
-    
+        resized_images[i, pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
+
     if not has_batch:
         return resized_images[0]
     return resized_images
@@ -59,7 +60,7 @@ def load_modality_config(modality_config_path: str):
         print(f"Loaded modality config: {path}")
     else:
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
-    
+
 
 class B1KPolicyWrapper:
     def __init__(
@@ -74,7 +75,7 @@ class B1KPolicyWrapper:
     ) -> None:
         # Load robot config from registry
         self.robot = MODALITY_CONFIGS[embodiment_tag.value]
-        self.robot_obs = ROBOT_OBS_CONFIGS[embodiment_tag.value] # Serving-only fields
+        self.robot_obs = ROBOT_OBS_CONFIGS[embodiment_tag.value]  # Serving-only fields
         self.modality_config = modality_config
         self.policy = policy
         self.text_prompt = text_prompt
@@ -89,16 +90,27 @@ class B1KPolicyWrapper:
         self.gripper_indices = []
         for i, action_key in enumerate(self.robot["action"].modality_keys):
             if self.robot["action"].action_configs[i].is_gripper:
-                self.gripper_indices.extend(list(range(
-                    self.modality_config["action"][action_key]["start"], self.modality_config["action"][action_key]["end"]
-                )))
+                self.gripper_indices.extend(
+                    list(
+                        range(
+                            self.modality_config["action"][action_key]["start"],
+                            self.modality_config["action"][action_key]["end"],
+                        )
+                    )
+                )
 
         # Vectorized action buffers (initialized on first call)
         self.batch_size = None
         self.action_buffer = None  # Shape: (batch, max_sequences, max_horizon, action_dim)
-        self.sequence_indices = None  # Shape: (batch, max_sequences) - current position in each sequence
-        self.sequence_lengths = None  # Shape: (batch, max_sequences) - total length of each sequence
-        self.num_active_sequences = None  # Shape: (batch,) - number of active sequences per batch element
+        self.sequence_indices = (
+            None  # Shape: (batch, max_sequences) - current position in each sequence
+        )
+        self.sequence_lengths = (
+            None  # Shape: (batch, max_sequences) - total length of each sequence
+        )
+        self.num_active_sequences = (
+            None  # Shape: (batch,) - number of active sequences per batch element
+        )
         self.step_counter = None  # Shape: (batch,)
 
     def reset(self):
@@ -118,10 +130,15 @@ class B1KPolicyWrapper:
             # We'll set action_dim when we first see actions
             if action_dim is not None:
                 self.action_buffer = np.zeros(
-                    (batch_size, self.temporal_ensemble_max, self.max_len, action_dim), dtype=np.float32
+                    (batch_size, self.temporal_ensemble_max, self.max_len, action_dim),
+                    dtype=np.float32,
                 )
-                self.sequence_indices = np.zeros((batch_size, self.temporal_ensemble_max), dtype=np.int32)
-                self.sequence_lengths = np.zeros((batch_size, self.temporal_ensemble_max), dtype=np.int32)
+                self.sequence_indices = np.zeros(
+                    (batch_size, self.temporal_ensemble_max), dtype=np.int32
+                )
+                self.sequence_lengths = np.zeros(
+                    (batch_size, self.temporal_ensemble_max), dtype=np.int32
+                )
                 self.num_active_sequences = np.zeros(batch_size, dtype=np.int32)
 
             self.step_counter = np.zeros(batch_size, dtype=np.int32)
@@ -133,7 +150,7 @@ class B1KPolicyWrapper:
         """
         prop_state = obs[f"{self.robot_obs['name']}::proprio"]
         while prop_state.ndim < 3:
-            prop_state = prop_state[None, :]    # Add B and T dims if necessary
+            prop_state = prop_state[None, :]  # Add B and T dims if necessary
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
         video = {}
@@ -141,12 +158,15 @@ class B1KPolicyWrapper:
             camera_obs = obs[self.robot_obs["observation"][camera_key]][..., :3]
             camera_obs = resize_with_pad(camera_obs, *self.obs_size)
             while camera_obs.ndim < 5:
-                camera_obs = camera_obs[None, ...]    # Add B and T dims if necessary
+                camera_obs = camera_obs[None, ...]  # Add B and T dims if necessary
             video[camera_key] = camera_obs  # Shape: (B, T, H, W, C)
         # Process state observations from robot config
         state = {}
         for state_key in sorted(self.modality_config["state"].keys()):
-            start, end = self.modality_config["state"][state_key]["start"], self.modality_config["state"][state_key]["end"]
+            start, end = (
+                self.modality_config["state"][state_key]["start"],
+                self.modality_config["state"][state_key]["end"],
+            )
             state[state_key] = prop_state[..., start:end]
         processed_input = {
             "video": video,
@@ -170,8 +190,10 @@ class B1KPolicyWrapper:
             indices_needing_inference = np.where(needs_inference)[0]
             # Create sub-batch for elements that need inference
             sub_batch = {k: v[indices_needing_inference] for k, v in input_batch.items()}
-            target_action, _ = self.policy.get_action(sub_batch)    # (sub_batch_size, T, action_dim)
-            target_action = np.concatenate([target_action[key] for key in self.robot["action"].modality_keys], axis=-1)
+            target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
+            target_action = np.concatenate(
+                [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
+            )
 
             # Initialize buffers on first inference
             if self.action_buffer is None:
@@ -205,7 +227,9 @@ class B1KPolicyWrapper:
         if self.action_buffer is None:
             # Need to infer once to get action_dim
             target_action, _ = self.policy.get_action(input_batch)
-            target_action = np.concatenate([target_action[key] for key in self.robot["action"].modality_keys], axis=-1)
+            target_action = np.concatenate(
+                [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
+            )
             action_dim = target_action.shape[2]
             self._ensure_batch_initialized(batch_size, action_dim)
 
@@ -223,14 +247,18 @@ class B1KPolicyWrapper:
 
             # Run inference only on sub-batch
             sub_batch = {k: v[indices_needing_replan] for k, v in input_batch.items()}
-            target_action, _ = self.policy.get_action(sub_batch)    # (sub_batch_size, T, action_dim)
-            target_action = np.concatenate([target_action[key] for key in self.robot["action"].modality_keys], axis=-1)
+            target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
+            target_action = np.concatenate(
+                [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
+            )
 
             # Add new sequences (vectorized where possible)
             seq_len = min(target_action.shape[1], self.max_len)
 
             # Handle elements that need shifting
-            needs_shift = self.num_active_sequences[indices_needing_replan] >= self.temporal_ensemble_max
+            needs_shift = (
+                self.num_active_sequences[indices_needing_replan] >= self.temporal_ensemble_max
+            )
             if needs_shift.any():
                 shift_indices = indices_needing_replan[needs_shift]
                 # Vectorized shift for all elements that need it
@@ -240,14 +268,18 @@ class B1KPolicyWrapper:
 
             # Calculate insert indices vectorized
             insert_indices = np.where(
-                needs_shift, self.temporal_ensemble_max - 1, self.num_active_sequences[indices_needing_replan]
+                needs_shift,
+                self.temporal_ensemble_max - 1,
+                self.num_active_sequences[indices_needing_replan],
             )
 
             # Increment active sequences for elements that don't need shifting
             self.num_active_sequences[indices_needing_replan[~needs_shift]] += 1
 
             # Store new sequences (fully vectorized using advanced indexing)
-            self.action_buffer[indices_needing_replan, insert_indices, :seq_len] = target_action[:, :seq_len]
+            self.action_buffer[indices_needing_replan, insert_indices, :seq_len] = target_action[
+                :, :seq_len
+            ]
             self.sequence_indices[indices_needing_replan, insert_indices] = 0
             self.sequence_lengths[indices_needing_replan, insert_indices] = seq_len
 
@@ -262,13 +294,19 @@ class B1KPolicyWrapper:
         batch_idx = batch_range[:, None, None]
         seq_idx = seq_range[None, :, None]
         pos_idx = current_indices[:, :, None]
-        actions_current = self.action_buffer[batch_idx, seq_idx, pos_idx].squeeze(-2)  # (B, max_seq, action_dim)
+        actions_current = self.action_buffer[batch_idx, seq_idx, pos_idx].squeeze(
+            -2
+        )  # (B, max_seq, action_dim)
 
         k = 0.005
         exp_weights = np.exp(k * seq_range)[None, :]  # (1, max_seq)
         masked_weights = exp_weights * active_mask  # (B, max_seq)
-        normalized_weights = masked_weights / masked_weights.sum(axis=1, keepdims=True)  # (B, max_seq)
-        final_actions = (actions_current * normalized_weights[:, :, None]).sum(axis=1)  # (B, action_dim)
+        normalized_weights = masked_weights / masked_weights.sum(
+            axis=1, keepdims=True
+        )  # (B, max_seq)
+        final_actions = (actions_current * normalized_weights[:, :, None]).sum(
+            axis=1
+        )  # (B, action_dim)
 
         # Preserve grippers from most recent rollout
         # Get the last active sequence index for each batch element
@@ -303,8 +341,10 @@ class B1KPolicyWrapper:
         """
         batched = input_obs[f"{self.robot_obs['name']}::proprio"].ndim != 1
         input_batch, batch_size = self.process_input(input_obs)
-        target_action, _ = self.policy.get_action(input_batch) # (B, T, action_dim)
-        target_action = np.concatenate([target_action[key] for key in self.robot["action"].modality_keys], axis=-1)
+        target_action, _ = self.policy.get_action(input_batch)  # (B, T, action_dim)
+        target_action = np.concatenate(
+            [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
+        )
         action_dim = target_action.shape[2]
 
         # Initialize buffers on first call
@@ -323,7 +363,9 @@ class B1KPolicyWrapper:
         self.num_active_sequences[~needs_shift] += 1
 
         # Insert new sequences to action buffer
-        insert_indices = np.where(needs_shift, self.temporal_ensemble_max - 1, self.num_active_sequences - 1)
+        insert_indices = np.where(
+            needs_shift, self.temporal_ensemble_max - 1, self.num_active_sequences - 1
+        )
         seq_len = target_action.shape[1]
         batch_range = np.arange(batch_size)
         self.action_buffer[batch_range, insert_indices, :seq_len] = target_action
@@ -337,13 +379,19 @@ class B1KPolicyWrapper:
         batch_idx = batch_range[:, None, None]
         seq_idx = seq_range[None, :, None]
         pos_idx = current_indices[:, :, None]
-        actions_current = self.action_buffer[batch_idx, seq_idx, pos_idx].squeeze(-2)  # (B, max_seq, action_dim)
+        actions_current = self.action_buffer[batch_idx, seq_idx, pos_idx].squeeze(
+            -2
+        )  # (B, max_seq, action_dim)
 
         k = 0.005
         exp_weights = np.exp(k * seq_range)[None, :]  # (1, max_seq)
         masked_weights = exp_weights * active_mask  # (B, max_seq)
-        normalized_weights = masked_weights / masked_weights.sum(axis=1, keepdims=True)  # (B, max_seq)
-        final_actions = (actions_current * normalized_weights[:, :, None]).sum(axis=1)  # (B, action_dim)
+        normalized_weights = masked_weights / masked_weights.sum(
+            axis=1, keepdims=True
+        )  # (B, max_seq)
+        final_actions = (actions_current * normalized_weights[:, :, None]).sum(
+            axis=1
+        )  # (B, action_dim)
 
         # Preserve grippers from most recent rollout
         for gripper_idx in self.gripper_indices:
