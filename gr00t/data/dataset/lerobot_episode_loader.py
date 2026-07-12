@@ -138,10 +138,13 @@ class LeRobotEpisodeLoader:
         4. (v3.0 only) Setting up the per-file parquet/video caches
 
         Args:
-            data_cache_size: Max v3.0 data parquet tables to keep cached.
-                ``None`` defaults to the data-file count (capped). Ignored for v2.x.
-            video_cache_size: Max v3.0 video decoders to keep cached.
-                ``None`` defaults to the video-file count (capped). Ignored for v2.x.
+            data_cache_size: Max v3.0 data parquet tables to keep cached per
+                process. ``None`` defaults to 4 (shard-local access needs ~2;
+                caches are per dataloader worker, so keep this small on
+                many-file datasets). Ignored for v2.x.
+            video_cache_size: Max v3.0 video decoders to keep cached per
+                process. ``None`` defaults to 8 (~2 shards × n_cameras).
+                Ignored for v2.x.
         """
         self.dataset_path = Path(dataset_path)
         self.decoder_kwargs = decoder_kwargs
@@ -330,8 +333,15 @@ class LeRobotEpisodeLoader:
         """Set up the v3.0 per-file parquet table cache and video decoder pool.
 
         Precomputes the projected data columns and each file's base global row
-        index (to map an episode's global range to a within-file slice). Cache
-        sizes default to the file counts (capped) for order-independent reuse.
+        index (to map an episode's global range to a within-file slice).
+
+        Default cache sizes are sized for the shard access pattern, not the
+        file count: a shard is one episode (one data file + one video per
+        camera) and a worker holds the current and prefetched shard, so ~2
+        tables and ~2×n_cameras decoders are ever live. Caches are per
+        dataloader-worker process; larger defaults let RSS grow for hours on
+        many-file datasets (100-task root: 955 files × ~70 MiB/table × workers
+        ⇒ kernel-OOM) with negligible cross-shard hit-rate in return.
         """
         self._data_columns = self._compute_needed_data_columns()
 
@@ -345,14 +355,14 @@ class LeRobotEpisodeLoader:
 
         n_data_files = len(self._file_row_base)
         self._table_cache_size = (
-            data_cache_size if data_cache_size is not None else max(1, min(n_data_files, 64))
+            data_cache_size if data_cache_size is not None else max(1, min(n_data_files, 4))
         )
 
         n_video_files = self._count_v30_video_files()
         pool_size = (
             video_cache_size
             if video_cache_size is not None
-            else max(1, min(n_video_files or 1, 32))
+            else max(1, min(n_video_files or 1, 8))
         )
         self._video_pool = VideoReaderPool(
             max_size=pool_size,
