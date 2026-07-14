@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from copy import deepcopy
 import functools
 import http
@@ -57,6 +58,13 @@ class WebsocketPolicyServer:
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
 
+        # Per-connection policy: shares the heavy (stateless) GR00T model but keeps its own
+        # temporal-ensemble buffers/step counter. Without this, concurrent eval env slots all share the
+        # single self._policy and corrupt each other's action histories (only slot 0 stays coherent).
+        # B1KPolicyWrapper.reset() only clears those numpy buffers (it does not touch self.policy).
+        conn_policy = copy.copy(self._policy)
+        conn_policy.reset()
+
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
@@ -65,13 +73,13 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 result = unpackb(await websocket.recv(), strict_map_key=False)
                 if "reset" in result:
-                    self._policy.reset()
+                    conn_policy.reset()
                     continue
 
                 obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                action = self._policy.act(obs)
+                action = conn_policy.act(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action = {
