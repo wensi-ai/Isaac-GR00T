@@ -148,17 +148,24 @@ class B1KPolicyWrapper:
         Process the input dictionary to match the expected input format for the model.
         Returns the processed input dictionary and batch size.
         """
+        # Normalize proprio to (B, T=1, D). Insert the time axis at position 1 so a batched input
+        # (B, D) keeps B as the batch (N robots) rather than being misread as T time-steps of 1 robot.
         prop_state = obs[f"{self.robot_obs['name']}::proprio"]
-        while prop_state.ndim < 3:
-            prop_state = prop_state[None, :]  # Add B and T dims if necessary
+        if prop_state.ndim == 1:  # (D,) single env
+            prop_state = prop_state[None, None, :]
+        elif prop_state.ndim == 2:  # (B, D) batched: one obs per env
+            prop_state = prop_state[:, None, :]
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
         video = {}
         for camera_key in sorted(self.robot_obs["observation"].keys()):
             camera_obs = obs[self.robot_obs["observation"][camera_key]][..., :3]
-            camera_obs = resize_with_pad(camera_obs, *self.obs_size)
-            while camera_obs.ndim < 5:
-                camera_obs = camera_obs[None, ...]  # Add B and T dims if necessary
+            camera_obs = resize_with_pad(camera_obs, *self.obs_size)  # (H,W,C) or (B,H,W,C)
+            # Normalize to (B, T=1, H, W, C) with the time axis at position 1 (same reasoning as proprio).
+            if camera_obs.ndim == 3:  # (H, W, C) single env
+                camera_obs = camera_obs[None, None, ...]
+            elif camera_obs.ndim == 4:  # (B, H, W, C) batched
+                camera_obs = camera_obs[:, None, ...]
             video[camera_key] = camera_obs  # Shape: (B, T, H, W, C)
         # Process state observations from robot config
         state = {}
