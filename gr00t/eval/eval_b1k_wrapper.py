@@ -62,6 +62,25 @@ def load_modality_config(modality_config_path: str):
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
 
 
+def _slice_batch(batch, indices):
+    """
+    Slice a (possibly nested) model-input batch along the leading batch axis by ``indices``.
+
+    process_input() returns a nested structure:
+        {"video": {cam: (B,T,H,W,C)}, "state": {key: (B,T,D)},
+         "language": {"...": [[p_0, ..., p_{B-1}]]}}
+    Sub-batching (selecting the env slots that need inference) must recurse into the nested dicts and
+    slice arrays / the language list by ``indices``. A plain top-level ``v[indices]`` fails because the
+    top-level values are dicts, not arrays (``dict[ndarray]`` -> "unhashable type: numpy.ndarray").
+    """
+    if isinstance(batch, dict):
+        return {k: _slice_batch(v, indices) for k, v in batch.items()}
+    if isinstance(batch, list):
+        # language: one entry per batch element (outer dim == batch) -> select the requested envs.
+        return [batch[int(i)] for i in indices]
+    return batch[indices]  # numpy array, sliced along the leading (batch) axis
+
+
 class B1KPolicyWrapper:
     def __init__(
         self,
@@ -178,7 +197,7 @@ class B1KPolicyWrapper:
         processed_input = {
             "video": video,
             "state": state,
-            "language": {"annotation.human.task_description": [[self.text_prompt] * batch_size]},
+            "language": {"annotation.human.task_description": [[self.text_prompt] for _ in range(batch_size)]},
         }
         return processed_input, batch_size
 
@@ -195,8 +214,8 @@ class B1KPolicyWrapper:
 
         if needs_inference.any():
             indices_needing_inference = np.where(needs_inference)[0]
-            # Create sub-batch for elements that need inference
-            sub_batch = {k: v[indices_needing_inference] for k, v in input_batch.items()}
+            # Create sub-batch for elements that need inference (recurses into video/state/language).
+            sub_batch = _slice_batch(input_batch, indices_needing_inference)
             target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
             target_action = np.concatenate(
                 [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
@@ -252,8 +271,8 @@ class B1KPolicyWrapper:
         if needs_replan.any():
             indices_needing_replan = np.where(needs_replan)[0]
 
-            # Run inference only on sub-batch
-            sub_batch = {k: v[indices_needing_replan] for k, v in input_batch.items()}
+            # Run inference only on sub-batch (recurses into video/state/language).
+            sub_batch = _slice_batch(input_batch, indices_needing_replan)
             target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
             target_action = np.concatenate(
                 [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
