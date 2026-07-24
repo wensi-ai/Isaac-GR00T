@@ -62,6 +62,25 @@ def load_modality_config(modality_config_path: str):
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
 
 
+def _slice_batch(batch, indices):
+    """
+    Slice a (possibly nested) model-input batch along the leading batch axis by ``indices``.
+
+    process_input() returns a nested structure:
+        {"video": {cam: (B,T,H,W,C)}, "state": {key: (B,T,D)},
+         "language": {"...": [[p_0, ..., p_{B-1}]]}}
+    Sub-batching (selecting the env slots that need inference) must recurse into the nested dicts and
+    slice arrays / the language list by ``indices``. A plain top-level ``v[indices]`` fails because the
+    top-level values are dicts, not arrays (``dict[ndarray]`` -> "unhashable type: numpy.ndarray").
+    """
+    if isinstance(batch, dict):
+        return {k: _slice_batch(v, indices) for k, v in batch.items()}
+    if isinstance(batch, list):
+        # language: one entry per batch element (outer dim == batch) -> select the requested envs.
+        return [batch[int(i)] for i in indices]
+    return batch[indices]  # numpy array, sliced along the leading (batch) axis
+
+
 class B1KPolicyWrapper:
     def __init__(
         self,
@@ -148,17 +167,24 @@ class B1KPolicyWrapper:
         Process the input dictionary to match the expected input format for the model.
         Returns the processed input dictionary and batch size.
         """
+        # Normalize proprio to (B, T=1, D). Insert the time axis at position 1 so a batched input
+        # (B, D) keeps B as the batch (N robots) rather than being misread as T time-steps of 1 robot.
         prop_state = obs[f"{self.robot_obs['name']}::proprio"]
-        while prop_state.ndim < 3:
-            prop_state = prop_state[None, :]  # Add B and T dims if necessary
+        if prop_state.ndim == 1:  # (D,) single env
+            prop_state = prop_state[None, None, :]
+        elif prop_state.ndim == 2:  # (B, D) batched: one obs per env
+            prop_state = prop_state[:, None, :]
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
         video = {}
         for camera_key in sorted(self.robot_obs["observation"].keys()):
             camera_obs = obs[self.robot_obs["observation"][camera_key]][..., :3]
-            camera_obs = resize_with_pad(camera_obs, *self.obs_size)
-            while camera_obs.ndim < 5:
-                camera_obs = camera_obs[None, ...]  # Add B and T dims if necessary
+            camera_obs = resize_with_pad(camera_obs, *self.obs_size)  # (H,W,C) or (B,H,W,C)
+            # Normalize to (B, T=1, H, W, C) with the time axis at position 1 (same reasoning as proprio).
+            if camera_obs.ndim == 3:  # (H, W, C) single env
+                camera_obs = camera_obs[None, None, ...]
+            elif camera_obs.ndim == 4:  # (B, H, W, C) batched
+                camera_obs = camera_obs[:, None, ...]
             video[camera_key] = camera_obs  # Shape: (B, T, H, W, C)
         # Process state observations from robot config
         state = {}
@@ -171,7 +197,7 @@ class B1KPolicyWrapper:
         processed_input = {
             "video": video,
             "state": state,
-            "language": {"annotation.human.task_description": [[self.text_prompt] * batch_size]},
+            "language": {"annotation.human.task_description": [[self.text_prompt] for _ in range(batch_size)]},
         }
         return processed_input, batch_size
 
@@ -188,8 +214,8 @@ class B1KPolicyWrapper:
 
         if needs_inference.any():
             indices_needing_inference = np.where(needs_inference)[0]
-            # Create sub-batch for elements that need inference
-            sub_batch = {k: v[indices_needing_inference] for k, v in input_batch.items()}
+            # Create sub-batch for elements that need inference (recurses into video/state/language).
+            sub_batch = _slice_batch(input_batch, indices_needing_inference)
             target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
             target_action = np.concatenate(
                 [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
@@ -245,8 +271,8 @@ class B1KPolicyWrapper:
         if needs_replan.any():
             indices_needing_replan = np.where(needs_replan)[0]
 
-            # Run inference only on sub-batch
-            sub_batch = {k: v[indices_needing_replan] for k, v in input_batch.items()}
+            # Run inference only on sub-batch (recurses into video/state/language).
+            sub_batch = _slice_batch(input_batch, indices_needing_replan)
             target_action, _ = self.policy.get_action(sub_batch)  # (sub_batch_size, T, action_dim)
             target_action = np.concatenate(
                 [target_action[key] for key in self.robot["action"].modality_keys], axis=-1
